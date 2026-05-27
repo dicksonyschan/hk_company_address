@@ -1,0 +1,25 @@
+cr:
+  base_url: "https://data.cr.gov.hk/cr/api/api/v1/api_builder/json/local/search"
+  page_size: 1000          # 每頁抓取筆數
+  chunk_size: 10000        # Polars streaming chunk
+  raw_dir: "data/raw"
+  request_timeout: 30      # 秒
+  retry_attempts: 3
+
+als:
+  base_url: "https://www.als.ogcio.gov.hk/lookup"
+  concurrency: 8           # 同時連線數 (建議 5-10)
+  rate_limit: 15           # 每秒最大請求數
+  confidence_threshold: 70 # 低於此分數標記人工覆核
+  request_timeout: 5       # 秒
+  retry_attempts: 3
+  result_count: 1          # 每次查詢回傳筆數 (取最高分)
+
+db:
+  path: "data/hk_companies.duckdb"
+
+logging:
+  level: "INFO"
+  file: "data/pipeline.log"
+
+alias_map_path: "data/alias_map.json"
