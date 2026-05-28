@@ -29,6 +29,7 @@ API：
 import asyncio
 import logging
 import random
+import sys
 import time
 import uuid
 from collections import deque
@@ -49,6 +50,10 @@ from tenacity import (
 )
 
 logger = logging.getLogger(__name__)
+
+# httpx 过於詳細，只顯示 WARNING 以上
+ logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 _USER_AGENTS = deque([
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -131,6 +136,8 @@ class CRDownloaderBrn:
         self.cb_threshold: int = brn_cfg.get("cb_threshold", 10)
         self.cb_cooldown: float = brn_cfg.get("cb_cooldown", 60.0)
         self.request_timeout: float = cr_cfg.get("request_timeout", 30)
+        # 每隔多少筆在終端 print 一行進度（可在 config 読入）
+        self.progress_every: int = brn_cfg.get("progress_every", 500)
 
         self.db = db
         self.cb = CircuitBreaker(self.cb_threshold, self.cb_cooldown)
@@ -154,10 +161,6 @@ class CRDownloaderBrn:
         }
 
     def _build_url(self, brn: str) -> str:
-        """
-        手動拼接 URL，保留方括號不被 encode。
-        CR API 要求 query[0][key1] 格式，httpx 預設會將 [ ] encode 成 %5B %5D。
-        """
         return (
             f"{self.base_url}"
             f"?query[0][key1]=Brn"
@@ -167,13 +170,6 @@ class CRDownloaderBrn:
         )
 
     async def _fetch_brn(self, client: httpx.AsyncClient, brn: str) -> list[dict] | None:
-        """
-        查詢單筆 BRN。
-        回傳：
-          - list[dict]：查詢成功（可能空 list 表示 miss）
-          - None：API 回傳 400，視為 miss（不重試）
-        僅對 429/503/網路錯誤重試。
-        """
         url = self._build_url(brn)
 
         @retry(
@@ -186,25 +182,19 @@ class CRDownloaderBrn:
             reraise=True,
         )
         async def _do_fetch() -> list[dict] | None:
-            resp = await client.get(
-                url,
-                timeout=self.request_timeout,
-                headers=self._next_headers(),
-            )
-            # 400 = BRN 不存在 / 不合法，視為 miss，不重試
+            resp = await client.get(url, timeout=self.request_timeout, headers=self._next_headers())
             if resp.status_code == 400:
-                logger.debug(f"BRN={brn} → 400（視為 miss）")
-                return None
+                return None  # BRN 不存在，視為 miss，不重試
             if resp.status_code == 429:
                 retry_after = float(resp.headers.get("Retry-After", self.cb_cooldown))
                 logger.warning(f"BRN={brn} → 429，等待 {retry_after}s")
                 self.cb.record_failure()
                 await asyncio.sleep(retry_after)
-                resp.raise_for_status()  # 觸發重試
+                resp.raise_for_status()
             if resp.status_code == 503:
                 logger.warning(f"BRN={brn} → 503")
                 self.cb.record_failure()
-                resp.raise_for_status()  # 觸發重試
+                resp.raise_for_status()
             resp.raise_for_status()
             data = resp.json()
             return data if isinstance(data, list) else []
@@ -212,15 +202,9 @@ class CRDownloaderBrn:
         return await _do_fetch()
 
     async def _query_one(
-        self,
-        client: httpx.AsyncClient,
-        sem: asyncio.Semaphore,
-        brn: str,
-        batch_id: str,
+        self, client: httpx.AsyncClient, sem: asyncio.Semaphore, brn: str, batch_id: str
     ) -> dict:
         if self.cb.is_open():
-            cooldown_remaining = self.cb.cooldown - (time.monotonic() - self.cb._opened_at)
-            logger.debug(f"Circuit Breaker OPEN，跳過 BRN={brn}，剩餘冷卻 {cooldown_remaining:.1f}s")
             return {"brn": brn, "status": "pending", "queried_at": None, "batch_id": batch_id, "records": []}
 
         await asyncio.sleep(random.uniform(self.jitter_min, self.jitter_max))
@@ -229,31 +213,13 @@ class CRDownloaderBrn:
             try:
                 result = await self._fetch_brn(client, brn)
                 self.cb.record_success()
-                # None = 400 miss；[] = 空結果 miss；[...] = hit
                 if result is None or len(result) == 0:
-                    status = "miss"
-                    records = []
-                else:
-                    status = "hit"
-                    records = result
-                logger.debug(f"BRN={brn} → {status}（{len(records)} 筆）")
-                return {
-                    "brn": brn,
-                    "status": status,
-                    "queried_at": datetime.now().isoformat(),
-                    "batch_id": batch_id,
-                    "records": records,
-                }
+                    return {"brn": brn, "status": "miss", "queried_at": datetime.now().isoformat(), "batch_id": batch_id, "records": []}
+                return {"brn": brn, "status": "hit", "queried_at": datetime.now().isoformat(), "batch_id": batch_id, "records": result}
             except Exception as exc:
                 self.cb.record_failure()
                 logger.error(f"BRN={brn} 最終失敗：{exc}")
-                return {
-                    "brn": brn,
-                    "status": "pending",
-                    "queried_at": None,
-                    "batch_id": batch_id,
-                    "records": [],
-                }
+                return {"brn": brn, "status": "pending", "queried_at": None, "batch_id": batch_id, "records": []}
 
     def _flush_to_parquet(self, hit_records: list[dict], batch_id: str):
         if not hit_records:
@@ -262,7 +228,6 @@ class CRDownloaderBrn:
         output_parquet = self.raw_dir / f"cr_brn_{today}.parquet"
         self._today_parquet = output_parquet
         fetched_at = datetime.now().isoformat()
-
         for r in hit_records:
             r["fetched_at"] = fetched_at
 
@@ -279,10 +244,8 @@ class CRDownloaderBrn:
         existing = {k: v for k, v in rename_map.items() if k in df.columns}
         df = df.rename(existing)
         df = df.rename(
-            {c: c.lower().replace(" ", "_").replace("-", "_")
-             for c in df.columns if c not in existing.values()}
+            {c: c.lower().replace(" ", "_").replace("-", "_") for c in df.columns if c not in existing.values()}
         )
-
         arrow_batch = df.to_arrow()
         if self._writer is None:
             self._schema = arrow_batch.schema
@@ -295,7 +258,6 @@ class CRDownloaderBrn:
                     if field.name not in df.columns:
                         df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias(field.name))
                 arrow_batch = df.select([f.name for f in self._schema]).to_arrow().cast(self._schema)
-
         self._writer.write_table(arrow_batch)
         logger.info(f"Parquet flush: {len(hit_records)} 筆 hit（batch={batch_id}）")
 
@@ -310,34 +272,54 @@ class CRDownloaderBrn:
             logger.info("brn_scan_queue 中無 pending BRN，批次結束")
             return {"total": 0, "hit": 0, "miss": 0, "skipped": 0}
 
-        logger.info(f"=== BRN 批次開始 batch={batch_id}，取得 {len(pending_brns)} 筆 pending ===")
+        total_in_batch = len(pending_brns)
+        logger.info(f"=== BRN 批次開始 batch={batch_id}，取得 {total_in_batch:,} 筆 pending ===")
 
         sem = asyncio.Semaphore(self.concurrency)
         tasks_results: list[dict] = []
         all_hit_records: list[dict] = []
         consecutive_miss = 0
         batch_stopped = False
+        done_count = 0
+        hit_count = 0
+        miss_count = 0
+        batch_start = time.monotonic()
 
         async with httpx.AsyncClient(http2=True) as client:
             tasks = [self._query_one(client, sem, brn, batch_id) for brn in pending_brns]
             for coro in asyncio.as_completed(tasks):
                 result = await coro
                 tasks_results.append(result)
+                done_count += 1
 
                 if result["status"] == "hit":
+                    hit_count += 1
                     consecutive_miss = 0
                     all_hit_records.extend(result["records"])
                     if len(all_hit_records) >= self.batch_write:
                         self._flush_to_parquet(all_hit_records, batch_id)
                         all_hit_records = []
                 elif result["status"] == "miss":
+                    miss_count += 1
                     consecutive_miss += 1
                     if consecutive_miss >= self.miss_limit:
-                        logger.info(
-                            f"本批連續 miss {consecutive_miss} 次達到門檻 ({self.miss_limit})，停止本批"
-                        )
+                        logger.info(f"本批連續 miss {consecutive_miss} 次達到門檻 ({self.miss_limit})，停止本批")
                         batch_stopped = True
                         break
+
+                # 終端進度計數器（每 progress_every 筆刷新一行）
+                if done_count % self.progress_every == 0 or done_count == total_in_batch:
+                    elapsed = time.monotonic() - batch_start
+                    rate = done_count / elapsed if elapsed > 0 else 0
+                    pct = done_count / total_in_batch * 100
+                    print(
+                        f"\r[batch={batch_id}] {done_count:,}/{total_in_batch:,} "
+                        f"({pct:.1f}%) | hit={hit_count:,} miss={miss_count:,} "
+                        f"| {rate:.0f} BRN/s",
+                        end="", flush=True
+                    )
+
+        print()  # 換行
 
         if all_hit_records:
             self._flush_to_parquet(all_hit_records, batch_id)
@@ -348,8 +330,8 @@ class CRDownloaderBrn:
 
         stats = {
             "total": len(tasks_results),
-            "hit": sum(1 for r in tasks_results if r["status"] == "hit"),
-            "miss": sum(1 for r in tasks_results if r["status"] == "miss"),
+            "hit": hit_count,
+            "miss": miss_count,
             "skipped": sum(1 for r in tasks_results if r["status"] == "pending"),
             "batch_stopped_early": batch_stopped,
         }
@@ -371,8 +353,9 @@ class CRDownloaderBrn:
             batch_num += 1
             total_hit += stats["hit"]
             total_miss += stats["miss"]
-            logger.info(
-                f"[download_all] 累計 batch={batch_num}, hit={total_hit:,}, miss={total_miss:,}"
+            print(
+                f"[download_all] batch #{batch_num} 完成 | "
+                f"累計 hit={total_hit:,}  miss={total_miss:,}"
             )
 
         self.close()
