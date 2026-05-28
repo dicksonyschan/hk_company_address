@@ -9,6 +9,7 @@ pipeline.py
 - pipeline 結束時呼叫 als.aclose() 關閉持久化 HTTP client
 - 依 config["cr"]["downloader"] 動態選擇 CRDownloader 或 CRDownloaderBrn
 - 修正 run_delta() 缺少 write_raw 的 bug（與 run_full 行為一致）
+- _build_master_df 新增 company_type / date_of_incorporation / re_domiciliation_date 欄位
 """
 
 import asyncio
@@ -33,6 +34,9 @@ CR_FIELD_MAP = {
 }
 
 _FLUSH_SIZE = 5000  # 每批寫入 master 的筆數
+
+# 從 Parquet 傳入 master 的額外欄位
+_EXTRA_COLS = ["company_type", "date_of_incorporation", "re_domiciliation_date"]
 
 
 class Pipeline:
@@ -64,6 +68,10 @@ class Pipeline:
         for required in ["cr_no", "name_zh", "name_en", "address_raw"]:
             if required not in df.columns:
                 df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias(required))
+        # 確保額外欄位存在（舊格式 Parquet 可能缺少）
+        for col in _EXTRA_COLS:
+            if col not in df.columns:
+                df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias(col))
         return df
 
     def _build_master_df(
@@ -75,6 +83,7 @@ class Pipeline:
         """
         用 Polars 向量化組裝 master DataFrame，
         取代逐行 dict append（大資料量快 10-30x）。
+        包含 company_type / date_of_incorporation / re_domiciliation_date。
         """
         als_cols = ["geo_address", "region", "district", "street_name",
                     "building_name", "latitude", "longitude", "score", "manual_review"]
@@ -88,32 +97,31 @@ class Pipeline:
 
         als_df = pl.DataFrame(als_data)
 
-        base = df.select(["cr_no", "name_zh", "name_en", "address_raw"]).with_columns(
+        base_cols = ["cr_no", "name_zh", "name_en", "address_raw"] + _EXTRA_COLS
+        base = df.select(base_cols).with_columns(
             pl.Series("address_clean", addresses_clean)
         )
         return pl.concat([base, als_df], how="horizontal")
 
     async def run_full(self):
         logger.info("=== 全量模式開始 ===")
-        chunk_size = self.config.get("cr", {}).get("chunk_size", 10000)  # P3 #22
+        chunk_size = self.config.get("cr", {}).get("chunk_size", 10000)
 
         parquet_path = await self.downloader.download_all(resume=True)
 
-        # P2 #13: 改用 scan_parquet 避免全量載入記憶體 (OOM)
         df = pl.scan_parquet(parquet_path).collect()
         df = self._normalize_columns(df)
         self.db.write_raw(df)
 
-        # P2 #14: checkpoint — 取出 master 已有 cr_no，跳過已處理的記錄
+        # checkpoint — 取出 master 已有 cr_no，跳過已處理的記錄
         existing_cr_nos: set[str] = set()
         try:
             rows = self.db.con.execute("SELECT cr_no FROM master").fetchall()
             existing_cr_nos = {r[0] for r in rows}
             logger.info(f"checkpoint: master 已有 {len(existing_cr_nos)} 筆，將跳過")
         except Exception:
-            pass  # master 表可能尚未建立
+            pass
 
-        # 範陣已存在記錄
         if existing_cr_nos:
             df = df.filter(~pl.col("cr_no").is_in(existing_cr_nos))
             logger.info(f"過濾後需處理: {len(df)} 筆")
@@ -125,10 +133,8 @@ class Pipeline:
             addresses_clean = self.cleaner.clean_batch(addresses_raw)
             als_results = await self.als.process_batch(addresses_clean)
 
-            # Polars 向量化組裝
             master_df = self._build_master_df(df, addresses_clean, als_results)
 
-            # 分批 flush（每 _FLUSH_SIZE 筆）
             records = master_df.to_dicts()
             for i in range(0, len(records), _FLUSH_SIZE):
                 self.db.write_master(records[i: i + _FLUSH_SIZE])
@@ -150,8 +156,6 @@ class Pipeline:
             return
 
         delta_df = self._normalize_columns(delta_df)
-
-        # 修正 bug：補加 write_raw，與 run_full 行為一致
         self.db.write_raw(delta_df)
 
         addresses_clean = self.cleaner.clean_batch(delta_df["address_raw"].to_list())
@@ -166,6 +170,5 @@ class Pipeline:
         logger.info(f"=== 增量完成 === {summary}")
 
     def close(self):
-        # P3 #21: 改用 asyncio.run()，避免 Python 3.10+ DeprecationWarning
         asyncio.run(self.als.aclose())
         self.db.close()

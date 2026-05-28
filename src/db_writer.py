@@ -6,6 +6,7 @@ DuckDB 讀寫封裝：建表、upsert cache、寫入 master。
 - 新增 get_cache_batch（批次查詢 cache，減少 DB round-trip）
 - write_master flush 門檻由 1000 提升至 5000
 - init_brn_queue: numeric 模式改用 DuckDB generate_series，避免 Python 生成 1 億筆 list，速度提升 10-50x
+- master 表新增 company_type / date_of_incorporation / re_domiciliation_date 欄位
 """
 
 import logging
@@ -52,23 +53,33 @@ CREATE TABLE IF NOT EXISTS address_cache (
 );
 
 CREATE TABLE IF NOT EXISTS master (
-    cr_no         VARCHAR PRIMARY KEY,
-    name_zh       VARCHAR,
-    name_en       VARCHAR,
-    address_raw   VARCHAR,
-    address_clean VARCHAR,
-    geo_address   VARCHAR,
-    region        VARCHAR,
-    district      VARCHAR,
-    street_name   VARCHAR,
-    building_name VARCHAR,
-    latitude      DOUBLE,
-    longitude     DOUBLE,
-    confidence    DOUBLE,
-    manual_review BOOLEAN,
-    last_updated  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    cr_no                  VARCHAR PRIMARY KEY,
+    name_zh                VARCHAR,
+    name_en                VARCHAR,
+    address_raw            VARCHAR,
+    address_clean          VARCHAR,
+    geo_address            VARCHAR,
+    region                 VARCHAR,
+    district               VARCHAR,
+    street_name            VARCHAR,
+    building_name          VARCHAR,
+    latitude               DOUBLE,
+    longitude              DOUBLE,
+    confidence             DOUBLE,
+    manual_review          BOOLEAN,
+    company_type           VARCHAR,
+    date_of_incorporation  VARCHAR,
+    re_domiciliation_date  VARCHAR,
+    last_updated           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
+
+# 為已存在的 master 表補加新欄位（向下相容）
+_MIGRATE_STATEMENTS = [
+    "ALTER TABLE master ADD COLUMN IF NOT EXISTS company_type          VARCHAR",
+    "ALTER TABLE master ADD COLUMN IF NOT EXISTS date_of_incorporation VARCHAR",
+    "ALTER TABLE master ADD COLUMN IF NOT EXISTS re_domiciliation_date VARCHAR",
+]
 
 
 class DBWriter:
@@ -84,6 +95,12 @@ class DBWriter:
                 stmt = stmt.strip()
                 if stmt:
                     self.con.execute(stmt)
+            # 向下相容：為已存在的舊 master 表補加新欄位
+            for stmt in _MIGRATE_STATEMENTS:
+                try:
+                    self.con.execute(stmt)
+                except Exception:
+                    pass  # 欄位已存在時忽略
         logger.info("DuckDB 表初始化完成")
 
     # ---------- Cache ----------
@@ -185,26 +202,30 @@ class DBWriter:
                 r.get("geo_address"), r.get("region"), r.get("district"),
                 r.get("street_name"), r.get("building_name"),
                 r.get("latitude"), r.get("longitude"),
-                r.get("score", 0), r.get("manual_review", False), now,
+                r.get("score", 0), r.get("manual_review", False),
+                r.get("company_type"), r.get("date_of_incorporation"),
+                r.get("re_domiciliation_date"), now,
             )
             for r in records
         ]
-        # P1 #5: 鎖; P2 #8: ON CONFLICT 補齊所有地址欄位
         with self._lock:
             self.con.executemany("""
-                INSERT INTO master VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO master VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT (cr_no) DO UPDATE SET
-                    geo_address   = EXCLUDED.geo_address,
-                    region        = EXCLUDED.region,
-                    district      = EXCLUDED.district,
-                    street_name   = EXCLUDED.street_name,
-                    building_name = EXCLUDED.building_name,
-                    latitude      = EXCLUDED.latitude,
-                    longitude     = EXCLUDED.longitude,
-                    address_clean = EXCLUDED.address_clean,
-                    confidence    = EXCLUDED.confidence,
-                    manual_review = EXCLUDED.manual_review,
-                    last_updated  = EXCLUDED.last_updated
+                    geo_address           = EXCLUDED.geo_address,
+                    region                = EXCLUDED.region,
+                    district              = EXCLUDED.district,
+                    street_name           = EXCLUDED.street_name,
+                    building_name         = EXCLUDED.building_name,
+                    latitude              = EXCLUDED.latitude,
+                    longitude             = EXCLUDED.longitude,
+                    address_clean         = EXCLUDED.address_clean,
+                    confidence            = EXCLUDED.confidence,
+                    manual_review         = EXCLUDED.manual_review,
+                    company_type          = EXCLUDED.company_type,
+                    date_of_incorporation = EXCLUDED.date_of_incorporation,
+                    re_domiciliation_date = EXCLUDED.re_domiciliation_date,
+                    last_updated          = EXCLUDED.last_updated
             """, rows)
         logger.info(f"已寫入 master: {len(rows)} 筆")
 
@@ -268,7 +289,6 @@ class DBWriter:
             return total
 
         elif mode == "prefix":
-            # 懶生成 + 分批 executemany，避免一次 list 佔用大量記憶體
             import itertools
 
             def _iter_chunks():
