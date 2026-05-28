@@ -25,10 +25,32 @@ BRN 模式建議流程：
 import asyncio
 import logging
 import sys
+from collections import deque
 from pathlib import Path
 
 import click
 import yaml
+
+# 與 cr_downloader_brn.py 相同的 User-Agent 輪換池
+_VERIFY_USER_AGENTS = deque([
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+    "Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+])
+
+
+def _next_verify_headers() -> dict:
+    _VERIFY_USER_AGENTS.rotate(1)
+    return {
+        "User-Agent": _VERIFY_USER_AGENTS[0],
+        "Accept": "application/json",
+        "Referer": "https://www.cr.gov.hk/",
+    }
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -65,9 +87,9 @@ def setup_logging(config: dict):
 @click.option("--verify-hits", "verify_hits", is_flag=True, default=False,
               help="對已 hit 的 BRN 重新查 CR API，比對公司資料是否變更")
 @click.option("--older-than", "older_than", default=None, type=int,
-              help="--verify-hits: 只檢查超過 N 天未更新的 hit（剩省=全部）")
+              help="--verify-hits: 只檢查超過 N 天未更新的 hit")
 @click.option("--verify-batch-size", default=200, show_default=True,
-              help="--verify-hits 每批带入筆數")
+              help="--verify-hits 每批筆數")
 @click.option("--test-brn", is_flag=True, default=False)
 @click.option("--brn-start", default="71807826")
 @click.option("--brn-end", default="71807828")
@@ -103,7 +125,6 @@ def main(mode, yesterday, lookup,
             pipeline.close()
         return
 
-    # --verify-hits 檢查公司資料是否變更
     if verify_hits:
         asyncio.run(_run_verify_hits(config, older_than, verify_batch_size, logger))
         return
@@ -195,14 +216,6 @@ async def _run_verify_hits(
     batch_size: int,
     logger,
 ):
-    """
-    --verify-hits 實作：
-    1. 從 brn_scan_queue 抽取 hit 狀態的 BRN
-    2. 重新查 CR API
-    3. 比對 name_zh / name_en / address_raw 是否變更
-    4. 變更 -> 更新 companies_raw + master 重置地址欄位
-    5. 印出統計：樣本數 / updated / unchanged / gone（API 輸回 miss）
-    """
     import random
     import httpx
     from src.db_writer import DBWriter
@@ -219,7 +232,7 @@ async def _run_verify_hits(
 
     hit_brns = db.fetch_hit_batch(batch_size=batch_size, older_than_days=older_than)
     if not hit_brns:
-        msg = f"\n無符合條件的 hit BRN"
+        msg = "\n無符合條件的 hit BRN"
         if older_than:
             msg += f"（指定: 超過 {older_than} 天未更新）"
         print(msg)
@@ -227,7 +240,7 @@ async def _run_verify_hits(
         return
 
     label = f"超過 {older_than} 天" if older_than else "全部"
-    logger.info(f"=== verify-hits 開始：{label} hit，本批 {len(hit_brns)} 筆 BRN ===")
+    logger.info(f"=== verify-hits 開始：{label} hit，本批 {len(hit_brns)} 筆 ===")
     print(f"\n檢查範圍: {label} hit，本批 {len(hit_brns)} 筆")
 
     stats = {"updated": 0, "unchanged": 0, "gone": 0, "error": 0}
@@ -249,11 +262,12 @@ async def _run_verify_hits(
             f"&query[0][key3]={brn}"
             f"&format=json"
         )
+        # 加上 User-Agent + Referer，避免 CR API 因無標頭返回 405
+        headers = _next_verify_headers()
         async with sem:
             try:
-                resp = await client.get(url, timeout=request_timeout)
+                resp = await client.get(url, timeout=request_timeout, headers=headers)
                 if resp.status_code == 400:
-                    # BRN 已不存在
                     stats["gone"] += 1
                     logger.info(f"BRN {brn} 已不存在（gone）")
                     return
@@ -270,10 +284,12 @@ async def _run_verify_hits(
                 if result == "updated":
                     updated_brns.append(brn)
                     logger.info(f"BRN {brn} 資料已變更")
+                done = stats["updated"] + stats["unchanged"] + stats["gone"] + stats["error"]
                 print(
-                    f"\r[verify] 已處理 {stats['updated']+stats['unchanged']+stats['gone']+stats['error']}/{len(hit_brns)}"
-                    f"  updated={stats['updated']} unchanged={stats['unchanged']} gone={stats['gone']}",
-                    end="", flush=True
+                    f"\r[verify] {done}/{len(hit_brns)}"
+                    f"  updated={stats['updated']} unchanged={stats['unchanged']}"
+                    f" gone={stats['gone']} error={stats['error']}",
+                    end="", flush=True,
                 )
             except Exception as e:
                 stats["error"] += 1
@@ -281,10 +297,8 @@ async def _run_verify_hits(
 
     sem = asyncio.Semaphore(config.get("cr_brn", {}).get("concurrency", 10))
     async with httpx.AsyncClient(http2=True) as client:
-        tasks = [_check_one(client, sem, brn) for brn in hit_brns]
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*[_check_one(client, sem, b) for b in hit_brns])
     print()
-
     db.close()
 
     print("\n" + "=" * 50)
@@ -318,7 +332,7 @@ async def _run_test_brn(config: dict, brn_start: str, brn_end: str, logger):
         return (int(s), "numeric") if _re.match(r'^\d+$', s) else (s, "alpha")
 
     start_val, start_type = _parse_brn(brn_start)
-    end_val, end_type   = _parse_brn(brn_end)
+    end_val, end_type = _parse_brn(brn_end)
 
     db = DBWriter(config["db"]["path"])
     logger.info("[1/5] DuckDB 建表完成")
