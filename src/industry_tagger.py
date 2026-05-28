@@ -23,10 +23,11 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# HKICLS 行業代碼對照表（香港標準行業分類 2.0，精簡版主要行業）
+# HSIC 行業代碼對照表（Hong Kong Standard Industrial Classification，精簡版主要行業）
 # 來源：政府統計處《香港標準行業分類（第 2.0 版）》
+# P3 #24: 重命名為 HSIC_SECTION_MAP（對齊官方縮寫）
 # ---------------------------------------------------------------------------
-HKICLS_MAP: dict[str, dict] = {
+HSIC_SECTION_MAP: dict[str, dict] = {
     "A": {"name_zh": "農業、林業及漁業", "name_en": "Agriculture, Forestry and Fishing",
           "keywords_zh": ["農業", "漁業", "林業", "農場", "種植", "水產", "農莊"],
           "keywords_en": ["Farm", "Fishery", "Agriculture", "Aquaculture", "Horticulture"]},
@@ -125,7 +126,14 @@ class IndustryTagger:
         self.db_path = db_path
         self.industry_cfg = config.get("industry", {})
         self.confidence_threshold = self.industry_cfg.get("confidence_threshold", 0.6)
-        self.deepseek_api_key = self.industry_cfg.get("deepseek_api_key") or os.getenv("DEEPSEEK_API_KEY", "")
+        # P2 #16: API key 只從環境變數讀取，避免 config.yaml 洩漏
+        _key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if not _key:
+            raise EnvironmentError(
+                "未設定 DEEPSEEK_API_KEY 環境變數。請在 .env 或系統環境中設定，"
+                "切勿將 key 寫入 config.yaml。"
+            )
+        self.deepseek_api_key = _key
         self.deepseek_model = self.industry_cfg.get("deepseek_model", "deepseek-chat")
         self.deepseek_batch_size = self.industry_cfg.get("batch_size", 50)
         self.keywords_path = Path(self.industry_cfg.get("keywords_path", "data/industry_keywords.json"))
@@ -137,13 +145,13 @@ class IndustryTagger:
     # ------------------------------------------------------------------
 
     def _load_keywords(self) -> dict[str, list[str]]:
-        """從 JSON 讀取關鍵詞表，若不存在則從 HKICLS_MAP 初始化。"""
+        """從 JSON 讀取關鍵詞表，若不存在則從 HSIC_SECTION_MAP 初始化。"""
         if self.keywords_path.exists():
             with open(self.keywords_path, encoding="utf-8") as f:
                 return json.load(f)
         # 初始化：合併 zh + en 關鍵詞
         kw_map = {}
-        for code, info in HKICLS_MAP.items():
+        for code, info in HSIC_SECTION_MAP.items():
             kw_map[code] = info["keywords_zh"] + info["keywords_en"]
         return kw_map
 
@@ -201,10 +209,10 @@ class IndustryTagger:
 
         industry_list = [
             {"code": code, "name_zh": info["name_zh"], "name_en": info["name_en"]}
-            for code, info in HKICLS_MAP.items()
+            for code, info in HSIC_SECTION_MAP.items()
         ]
 
-        prompt = f"""你是香港行業分類專家。以下是從香港公司名稱擷取的高頻詞列表，請將每個詞分類到最符合的 HKICLS（香港標準行業分類）代碼。
+        prompt = f"""你是香港行業分類專家。以下是從香港公司名稱擷取的高頻詞列表，請將每個詞分類到最符合的 HSIC（香港標準行業分類）代碼。
 
 行業代碼對照：
 {json.dumps(industry_list, ensure_ascii=False)}
@@ -260,7 +268,7 @@ class IndustryTagger:
 
         industry_list = [
             {"code": code, "name_zh": info["name_zh"]}
-            for code, info in HKICLS_MAP.items()
+            for code, info in HSIC_SECTION_MAP.items()
         ]
         names_list = [
             {"idx": i, "name_zh": c.get("name_zh", ""), "name_en": c.get("name_en", "")}
@@ -326,16 +334,17 @@ class IndustryTagger:
         con = duckdb.connect(self.db_path)
         self._ensure_industry_columns(con)
 
-        offset = 0
         total_tagged = 0
         total_llm = 0
         total_low_conf = 0
 
+        # P2 #15: cursor-based pagination（不用 OFFSET，避免 UPDATE 後 offset 漂移）
+        # 每批重新 SELECT WHERE industry_tag IS NULL，已標記記錄不再出現
         while True:
             rows = con.execute(
                 "SELECT cr_no, name_zh, name_en FROM master "
                 "WHERE industry_tag IS NULL "
-                f"LIMIT {batch_size} OFFSET {offset}"
+                f"ORDER BY cr_no LIMIT {batch_size}"
             ).fetchall()
             if not rows:
                 break
@@ -391,8 +400,7 @@ class IndustryTagger:
                 )
                 total_tagged += len(update_rows)
 
-            offset += batch_size
-            logger.info(f"進度：offset={offset}, 已標記={total_tagged}")
+            logger.info(f"進度：已標記={total_tagged}")
 
         con.close()
         logger.info(
@@ -427,7 +435,7 @@ class IndustryTagger:
 
     def _backfill_industry_names(self, con: duckdb.DuckDBPyConnection):
         """根據 industry_tag 填回行業中英文名稱。"""
-        for code, info in HKICLS_MAP.items():
+        for code, info in HSIC_SECTION_MAP.items():
             con.execute(
                 "UPDATE master SET industry_name_zh = ?, industry_name_en = ? "
                 "WHERE industry_tag = ? AND industry_name_zh IS NULL",

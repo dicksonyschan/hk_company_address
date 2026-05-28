@@ -23,3 +23,12 @@ logging:
   file: "data/pipeline.log"
 
 alias_map_path: "data/alias_map.json"
+
+industry:
+  keywords_path: data/industry_keywords.json
+  confidence_threshold: 0.8
+  enable_llm_fallback: true
+  enable_llm_keyword_mining: true
+  deepseek_model: deepseek-v4-flash
+  auto_mine_threshold: 10000
+  batch_size: 50

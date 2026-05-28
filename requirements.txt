@@ -8,9 +8,9 @@ polars>=0.20.0
 duckdb>=0.10.0
 
 # String / address processing
-rapidfuzz>=3.9.0
+# rapidfuzz>=3.9.0  # P3 #23: 已移除，原始碼未使用；如需模糊比對再加回
+# unicodedata2>=15.1.0  # P3 #23: 已移除，Python 內建 unicodedata 已足夠
 opencc-python-reimplemented>=0.1.7
-unicodedata2>=15.1.0
 
 # Utilities
 pyyaml>=6.0.1

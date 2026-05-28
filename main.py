@@ -43,9 +43,14 @@ def setup_logging(config: dict):
               help="增量模式: 昨日 Parquet 路徑")
 @click.option("--lookup", default=None,
               help="單筆地址查詢（測試用）")
+@click.option("--init-hsic", is_flag=True, default=False,
+              help="載入 HSIC 行業代碼表（從 data.gov.hk 下載）")
+@click.option("--tag-industry", is_flag=True, default=False,
+              help="對 master 表執行行業標籤（完成 --init-hsic 後使用）")
 @click.option("--config", "config_path", default="config.yaml",
               help="設定檔路徑")
-def main(mode: str, yesterday: str, lookup: str, config_path: str):
+def main(mode: str, yesterday: str, lookup: str,
+         init_hsic: bool, tag_industry: bool, config_path: str):
     config = load_config(config_path)
     setup_logging(config)
     logger = logging.getLogger("main")
@@ -75,7 +80,30 @@ def main(mode: str, yesterday: str, lookup: str, config_path: str):
             print(f"需人工覆核: {r.get('manual_review')}")
         else:
             print("無法標準化此地址")
+        asyncio.run(als.aclose())  # P1 #3: 關閉持久化 httpx.AsyncClient
         db.close()
+        return
+
+    # --init-hsic 模式
+    if init_hsic:
+        from src.cr_industry_codes import CRIndustryCodes
+        logger.info("=== 載入 HSIC 行業代碼表 ===")
+        hsic = CRIndustryCodes(config["db"]["path"])
+        hsic.load()
+        logger.info("=== HSIC 載入完成 ===")
+        return
+
+    # --tag-industry 模式
+    if tag_industry:
+        from src.industry_tagger import IndustryTagger
+        industry_cfg = config.get("industry", {})
+        llm_fallback = industry_cfg.get("enable_llm_fallback", True)
+        logger.info("=== 行業標籤開始 ===")
+        tagger = IndustryTagger(config, config["db"]["path"])
+        result = tagger.run(llm_fallback=llm_fallback)
+        logger.info(f"=== 行業標籤完成 === {result}")
+        for k, v in result.items():
+            print(f"  {k}: {v}")
         return
 
     # 全量 / 增量模式

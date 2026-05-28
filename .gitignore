@@ -1,0 +1,40 @@
+# 原始下載資料（可能含公司個資）
+data/raw/
+
+# DuckDB 資料庫（大型二進制，含公司資料）
+data/*.duckdb
+
+# Log 檔
+data/*.log
+
+# 環境變數（含 API key，絕對不 commit）
+.env
+.env.*
+
+# Python 快取
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虛擬環境
+.venv/
+venv/
+env/
+
+# IDE / 編輯器設定
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS 系統檔
+.DS_Store
+
+# 測試暫存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 注意: 以下種子資料應保留追蹤
+# data/alias_map.json         ← 保留
+# data/industry_keywords.json ← 保留

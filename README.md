@@ -13,11 +13,13 @@ hk_company_address/
 ├── config.yaml              # 所有可調參數
 ├── src/
 │   ├── __init__.py
-│   ├── cr_downloader.py     # 下載 CR 公開資料
-│   ├── address_cleaner.py   # 地址前處理 / 清洗
-│   ├── als_client.py        # Async ALS API 呼叫 + cache
-│   ├── db_writer.py         # DuckDB 讀寫
-│   └── pipeline.py          # 串接所有步驟的主流程
+│   ├── cr_downloader.py      # 下載 CR 公開資料
+│   ├── address_cleaner.py    # 地址前處理 / 清洗
+│   ├── als_client.py         # Async ALS API 呼叫 + cache
+│   ├── db_writer.py          # DuckDB 讀寫
+│   ├── pipeline.py           # 串接所有步驟的主流程
+│   ├── cr_industry_codes.py  # 從 data.gov.hk 下載 HSIC 代碼表
+│   └── industry_tagger.py    # 行業標籤（關鍵詞 + DeepSeek LLM）
 ├── data/
 │   ├── raw/                 # CR 原始下載 (自動建立)
 │   ├── cleaned/             # 清洗後暫存 (自動建立)
@@ -99,6 +101,19 @@ python main.py --mode full
 python main.py --mode delta
 ```
 
+### 行業代碼初始化
+
+```bash
+python main.py --init-hsic
+```
+
+### 行業標籤
+
+```bash
+export DEEPSEEK_API_KEY=your_key_here
+python main.py --tag-industry
+```
+
 只處理自上次執行後 CR 新增或修改的記錄，大幅節省 API 呼叫量。
 
 ### 單筆地址查詢（測試用）
@@ -158,6 +173,116 @@ ALS API 呼叫快取（避免重複請求）
 | confidence | ALS 信心分數 |
 | manual_review | 是否需人工覆核 |
 | last_updated | 最後更新時間 |
+
+---
+
+## 行業分類功能
+
+### 目錄結構（更新）
+
+```
+src/
+├── cr_industry_codes.py  # 從 data.gov.hk 下載 HSIC 代碼表
+└── industry_tagger.py    # 行業標籤主模組（關鍵詞 + DeepSeek LLM）
+```
+
+### 行業資料庫結構
+
+#### `industry_codes`（HSIC 參考表）
+
+| 欄位 | 說明 |
+|------|------|
+| code | HSIC 代碼（字母大類 A-S 或數字細類） |
+| level | 層級（1=大類, 2=中類, 3=小類） |
+| name_zh | 行業中文名稱 |
+| name_en | 行業英文名稱 |
+| parent_code | 父層代碼 |
+
+#### `master` 表新增行業欄位
+
+| 欄位 | 說明 |
+|------|------|
+| industry_tag | HSIC 大類代碼（如 "F"=建造業）|
+| industry_name_zh | 行業中文名稱 |
+| industry_name_en | 行業英文名稱 |
+| industry_method | 標籤來源：`keyword`（關鍵詞比對）/ `llm`（DeepSeek 分類）|
+| industry_conf | 信心分數（0–1）|
+| industry_review | 低信心待人工覆核（`TRUE`/`FALSE`）|
+
+### 行業功能 CLI
+
+**步驟一：初始化 HSIC 代碼表（首次使用）**
+
+```bash
+python main.py --init-hsic
+```
+
+從 `data.gov.hk` 下載完整 HSIC 代碼表，寫入 `industry_codes` 表。
+若政府 API 不可用，程式會直接報錯（不自動 fallback），請檢查網絡後重試。
+
+**步驟二：執行行業標籤**
+
+```bash
+python main.py --tag-industry
+```
+
+- **第一層**：關鍵詞規則比對（離線，極快）
+- **第二層**：未命中的送 DeepSeek API 批次分類（需設定 `DEEPSEEK_API_KEY`）
+- 信心分數 < 閾值（預設 0.8）的記錄標記 `industry_review = TRUE`
+
+**環境變數設定**
+
+```bash
+# .env 檔（不要 commit 到 git）
+DEEPSEEK_API_KEY=your_key_here
+```
+
+```bash
+# 或直接設定
+export DEEPSEEK_API_KEY=your_key_here
+python main.py --tag-industry
+```
+
+### 人工覆核流程
+
+查詢需覆核的行業記錄：
+
+```python
+import duckdb
+con = duckdb.connect('data/hk_companies.duckdb')
+df = con.execute("""
+    SELECT cr_no, name_zh, industry_tag, industry_conf
+    FROM master
+    WHERE industry_review = TRUE
+    ORDER BY industry_conf
+    LIMIT 20
+""").df()
+print(df)
+```
+
+人工確認後，更新並清除覆核旗標：
+
+```python
+con.execute("""
+    UPDATE master SET
+        industry_tag    = 'K',  -- 正確的 HSIC 代碼
+        industry_review = FALSE
+    WHERE cr_no = '12345678'
+""")
+```
+
+### config.yaml 行業設定
+
+```yaml
+industry:
+  keywords_path: data/industry_keywords.json   # 關鍵詞表路徑
+  confidence_threshold: 0.8                     # 低於此值標記人工覆核
+  enable_llm_fallback: true                     # 是否啟用 DeepSeek 二層分類
+  enable_llm_keyword_mining: true               # 是否自動擷取高頻詞擴充關鍵詞表
+  deepseek_model: deepseek-v4-flash             # DeepSeek 模型名稱
+  auto_mine_threshold: 10000                    # 未標記記錄超過此數量觸發自動挖掘
+  batch_size: 50                                # DeepSeek API 每批筆數
+```
 
 ---
 

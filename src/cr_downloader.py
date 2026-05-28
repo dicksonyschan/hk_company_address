@@ -55,12 +55,17 @@ class CRDownloader:
             return data
         return data.get("company", data.get("result", []))
 
-    def _get_last_page(self) -> int:
-        """從已下載 Parquet 分頁推算斷點，支援續傳。"""
-        pages = sorted(self.raw_dir.glob("page_*.parquet"))
-        if not pages:
-            return 0
-        return int(pages[-1].stem.split("_")[1]) + 1
+    def _get_resume_page(self) -> int:
+        """檢查今日 cr_raw_{today}.parquet 是否已存在，以決定斷點頁碼。
+        由於輸出為單一串流 Parquet，無法逐頁計算已寫入頁數；
+        若檔案已存在（上次中斷），從頭重跑以確保資料完整。
+        若需真正逐頁斷點，改用 page_{n:05d}.parquet 暫存模式。
+        """
+        today = datetime.now().strftime("%Y%m%d")
+        output_parquet = self.raw_dir / f"cr_raw_{today}.parquet"
+        if output_parquet.exists():
+            logger.info(f"發現今日 Parquet 已存在：{output_parquet}，將從頭重跑以確保完整性")
+        return 0
 
     async def _download_page(
         self,
@@ -79,7 +84,7 @@ class CRDownloader:
         全量下載所有分頁，並發執行（最多 _DOWNLOAD_CONCURRENCY 頁同時）。
         結果串流寫入單一 Parquet 檔，避免全量載入記憶體。
         """
-        start_page = self._get_last_page() if resume else 0
+        start_page = self._get_resume_page() if resume else 0
         today = datetime.now().strftime("%Y%m%d")
         output_parquet = self.raw_dir / f"cr_raw_{today}.parquet"
         fetched_at = datetime.now().isoformat()
@@ -103,10 +108,12 @@ class CRDownloader:
                 results = await asyncio.gather(*tasks)
 
                 any_data = False
-                # 按頁序排序後串流寫入
+                empty_in_batch = False
+                # 按頁序排序後串流寫入，遇第一個空頁即停止（避免多餘請求）
                 for pn, records in sorted(results, key=lambda x: x[0]):
                     if not records:
-                        continue
+                        empty_in_batch = True
+                        break
                     any_data = True
                     # 加入 fetched_at
                     for r in records:
@@ -129,7 +136,7 @@ class CRDownloader:
                     total_records += len(records)
                     logger.info(f"  頁 {pn:05d}: {len(records)} 筆（累計 {total_records}）")
 
-                if not any_data:
+                if not any_data or empty_in_batch:
                     logger.info(f"下載完成，共 {page_num} 頁，{total_records} 筆")
                     break
 

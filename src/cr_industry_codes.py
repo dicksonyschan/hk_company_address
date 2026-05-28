@@ -5,7 +5,7 @@ cr_industry_codes.py
 
 資料來源：
   - data.gov.hk《香港標準行業分類（第 2.0 版）》JSON
-  - 若政府 API 不可用，使用 src/industry_tagger.py 中的 HKICLS_MAP 作後備
+  - 下載失敗直接 raise（P3 #26），不自動 fallback
 """
 
 import json
@@ -15,7 +15,7 @@ from pathlib import Path
 import duckdb
 import httpx
 
-from .industry_tagger import HKICLS_MAP
+from .industry_tagger import HSIC_SECTION_MAP
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ class CRIndustryCodes:
     def load_from_gov(self, timeout: int = 15) -> bool:
         """
         嘗試從政府 API 下載 HKICLS 完整代碼表。
-        成功回傳 True，失敗回傳 False（呼叫方可 fallback 到 load_from_builtin）。
+        成功回傳 True，失敗回傳 False。呼叫方若需 fallback，請自行呼叫 load_from_builtin()。
         """
         try:
             resp = httpx.get(_HKICLS_GOV_URL, timeout=timeout, follow_redirects=True)
@@ -78,16 +78,24 @@ class CRIndustryCodes:
                 "name_en": info["name_en"],
                 "parent_code": None,
             }
-            for code, info in HKICLS_MAP.items()
+            for code, info in HSIC_SECTION_MAP.items()
         ]
         self._upsert(records)
         logger.info(f"已從內建 HKICLS_MAP 載入 {len(records)} 筆行業大類代碼")
 
     def load(self):
-        """嘗試政府 API，失敗則用內建資料。"""
+        """
+        P3 #26: 從政府 API 載入 HSIC 代碼表。
+        下載失敗直接 raise，不 fallback 到內建精簡版，
+        確保呼叫方能感知並處理（避免靜默降級影響行業細分準確性）。
+        如需使用內建精簡版，請直接呼叫 load_from_builtin()。
+        """
         self.init_table()
         if not self.load_from_gov():
-            self.load_from_builtin()
+            raise RuntimeError(
+                "無法從 data.gov.hk 下載 HSIC 代碼表，請檢查網絡或更新 _HKICLS_GOV_URL。"
+                "如需使用內建精簡版，請手動呼叫 load_from_builtin()。"
+            )
 
     def _parse_gov_json(self, data: dict | list) -> list[dict]:
         """

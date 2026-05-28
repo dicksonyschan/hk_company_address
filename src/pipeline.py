@@ -84,23 +84,43 @@ class Pipeline:
 
     async def run_full(self):
         logger.info("=== 全量模式開始 ===")
+        chunk_size = self.config.get("cr", {}).get("chunk_size", 10000)  # P3 #22
 
         parquet_path = await self.downloader.download_all(resume=True)
-        df = pl.read_parquet(parquet_path)
+
+        # P2 #13: 改用 scan_parquet 避免全量載入記憶體 (OOM)
+        df = pl.scan_parquet(parquet_path).collect()
         df = self._normalize_columns(df)
         self.db.write_raw(df)
 
-        addresses_raw = df["address_raw"].to_list()
-        addresses_clean = self.cleaner.clean_batch(addresses_raw)
-        als_results = await self.als.process_batch(addresses_clean)
+        # P2 #14: checkpoint — 取出 master 已有 cr_no，跳過已處理的記錄
+        existing_cr_nos: set[str] = set()
+        try:
+            rows = self.db.con.execute("SELECT cr_no FROM master").fetchall()
+            existing_cr_nos = {r[0] for r in rows}
+            logger.info(f"checkpoint: master 已有 {len(existing_cr_nos)} 筆，將跳過")
+        except Exception:
+            pass  # master 表可能尚未建立
 
-        # Polars 向量化組裝
-        master_df = self._build_master_df(df, addresses_clean, als_results)
+        # 範陣已存在記錄
+        if existing_cr_nos:
+            df = df.filter(~pl.col("cr_no").is_in(existing_cr_nos))
+            logger.info(f"過濾後需處理: {len(df)} 筆")
 
-        # 分批 flush（每 _FLUSH_SIZE 筆）
-        records = master_df.to_dicts()
-        for i in range(0, len(records), _FLUSH_SIZE):
-            self.db.write_master(records[i: i + _FLUSH_SIZE])
+        if len(df) == 0:
+            logger.info("所有記錄均已存在 master，跳過 ALS")
+        else:
+            addresses_raw = df["address_raw"].to_list()
+            addresses_clean = self.cleaner.clean_batch(addresses_raw)
+            als_results = await self.als.process_batch(addresses_clean)
+
+            # Polars 向量化組裝
+            master_df = self._build_master_df(df, addresses_clean, als_results)
+
+            # 分批 flush（每 _FLUSH_SIZE 筆）
+            records = master_df.to_dicts()
+            for i in range(0, len(records), _FLUSH_SIZE):
+                self.db.write_master(records[i: i + _FLUSH_SIZE])
 
         summary = self.db.summary()
         logger.info(f"=== 完成 === {summary}")
@@ -131,5 +151,6 @@ class Pipeline:
         logger.info(f"=== 增量完成 === {summary}")
 
     def close(self):
-        asyncio.get_event_loop().run_until_complete(self.als.aclose())
+        # P3 #21: 改用 asyncio.run()，避免 Python 3.10+ DeprecationWarning
+        asyncio.run(self.als.aclose())
         self.db.close()

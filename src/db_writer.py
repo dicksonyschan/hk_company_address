@@ -9,6 +9,7 @@ DuckDB 讀寫封裝：建表、upsert cache、寫入 master。
 
 import json
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -67,25 +68,28 @@ class DBWriter:
     def __init__(self, db_path: str):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.con = duckdb.connect(db_path)
+        self._lock = threading.Lock()  # P1 #5: 保護並發寫入
         self._init_tables()
 
     def _init_tables(self):
-        for stmt in CREATE_STATEMENTS.strip().split(";"):
-            stmt = stmt.strip()
-            if stmt:
-                self.con.execute(stmt)
+        with self._lock:
+            for stmt in CREATE_STATEMENTS.strip().split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    self.con.execute(stmt)
         logger.info("DuckDB 表初始化完成")
 
     # ---------- Cache ----------
 
     def get_cache(self, address_hash: str) -> Optional[dict]:
-        rows = self.con.execute(
-            "SELECT * FROM address_cache WHERE address_hash = ?", [address_hash]
-        ).fetchall()
-        if not rows:
-            return None
-        cols = [d[0] for d in self.con.description]
-        return dict(zip(cols, rows[0]))
+        with self._lock:
+            rows = self.con.execute(
+                "SELECT * FROM address_cache WHERE address_hash = ?", [address_hash]
+            ).fetchall()
+            if not rows:
+                return None
+            cols = [d[0] for d in self.con.description]
+            return dict(zip(cols, rows[0]))
 
     def get_cache_batch(self, address_hashes: list[str]) -> dict[str, dict]:
         """
@@ -95,56 +99,71 @@ class DBWriter:
         if not address_hashes:
             return {}
         placeholders = ", ".join(["?"] * len(address_hashes))
-        rows = self.con.execute(
-            f"SELECT * FROM address_cache WHERE address_hash IN ({placeholders})",
-            address_hashes,
-        ).fetchall()
-        if not rows:
-            return {}
-        cols = [d[0] for d in self.con.description]
-        return {row[0]: dict(zip(cols, row)) for row in rows}
+        with self._lock:
+            rows = self.con.execute(
+                f"SELECT * FROM address_cache WHERE address_hash IN ({placeholders})",
+                address_hashes,
+            ).fetchall()
+            if not rows:
+                return {}
+            cols = [d[0] for d in self.con.description]
+            return {row[0]: dict(zip(cols, row)) for row in rows}
 
     def upsert_cache(self, record: dict):
-        self.con.execute("""
-            INSERT INTO address_cache
-                (address_hash, address_clean, als_json, geo_address, score,
-                 region, district, street_name, building_name,
-                 latitude, longitude, manual_review)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (address_hash) DO UPDATE SET
-                als_json = EXCLUDED.als_json,
-                geo_address = EXCLUDED.geo_address,
-                score = EXCLUDED.score,
-                fetched_at = CURRENT_TIMESTAMP
-        """, [
-            record.get("address_hash"),
-            record.get("address_clean"),
-            record.get("als_json"),
-            record.get("geo_address"),
-            record.get("score", 0),
-            record.get("region"),
-            record.get("district"),
-            record.get("street_name"),
-            record.get("building_name"),
-            record.get("latitude"),
-            record.get("longitude"),
-            record.get("manual_review", False),
-        ])
+        # P1 #5: 鎖保護; P1 #6: ON CONFLICT 補全所有可變欄位
+        with self._lock:
+            self.con.execute("""
+                INSERT INTO address_cache
+                    (address_hash, address_clean, als_json, geo_address, score,
+                     region, district, street_name, building_name,
+                     latitude, longitude, manual_review)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (address_hash) DO UPDATE SET
+                    als_json      = EXCLUDED.als_json,
+                    geo_address   = EXCLUDED.geo_address,
+                    score         = EXCLUDED.score,
+                    region        = EXCLUDED.region,
+                    district      = EXCLUDED.district,
+                    street_name   = EXCLUDED.street_name,
+                    building_name = EXCLUDED.building_name,
+                    latitude      = EXCLUDED.latitude,
+                    longitude     = EXCLUDED.longitude,
+                    address_clean = EXCLUDED.address_clean,
+                    manual_review = EXCLUDED.manual_review,
+                    fetched_at    = CURRENT_TIMESTAMP
+            """, [
+                record.get("address_hash"),
+                record.get("address_clean"),
+                record.get("als_json"),
+                record.get("geo_address"),
+                record.get("score", 0),
+                record.get("region"),
+                record.get("district"),
+                record.get("street_name"),
+                record.get("building_name"),
+                record.get("latitude"),
+                record.get("longitude"),
+                record.get("manual_review", False),
+            ])
 
     # ---------- Raw & Master ----------
 
     def write_raw(self, df: pl.DataFrame):
         """寫入 companies_raw（upsert by cr_no）。"""
-        self.con.register("df_raw", df.to_arrow())
-        self.con.execute("""
-            INSERT INTO companies_raw
-            SELECT cr_no, name_zh, name_en, address_raw, fetched_at::TIMESTAMP
-            FROM df_raw
-            ON CONFLICT (cr_no) DO UPDATE SET
-                address_raw = EXCLUDED.address_raw,
-                fetched_at  = EXCLUDED.fetched_at
-        """)
-        self.con.unregister("df_raw")
+        # P1 #5: 鎖; P2 #9: try/finally 確保 unregister
+        with self._lock:
+            self.con.register("df_raw", df.to_arrow())
+            try:
+                self.con.execute("""
+                    INSERT INTO companies_raw
+                    SELECT cr_no, name_zh, name_en, address_raw, fetched_at::TIMESTAMP
+                    FROM df_raw
+                    ON CONFLICT (cr_no) DO UPDATE SET
+                        address_raw = EXCLUDED.address_raw,
+                        fetched_at  = EXCLUDED.fetched_at
+                """)
+            finally:
+                self.con.unregister("df_raw")
         logger.info(f"已寫入 companies_raw: {len(df)} 筆")
 
     def write_master(self, records: list[dict]):
@@ -163,27 +182,35 @@ class DBWriter:
             )
             for r in records
         ]
-        self.con.executemany("""
-            INSERT INTO master VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT (cr_no) DO UPDATE SET
-                geo_address   = EXCLUDED.geo_address,
-                region        = EXCLUDED.region,
-                district      = EXCLUDED.district,
-                confidence    = EXCLUDED.confidence,
-                manual_review = EXCLUDED.manual_review,
-                last_updated  = EXCLUDED.last_updated
-        """, rows)
+        # P1 #5: 鎖; P2 #8: ON CONFLICT 補齊所有地址欄位
+        with self._lock:
+            self.con.executemany("""
+                INSERT INTO master VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT (cr_no) DO UPDATE SET
+                    geo_address   = EXCLUDED.geo_address,
+                    region        = EXCLUDED.region,
+                    district      = EXCLUDED.district,
+                    street_name   = EXCLUDED.street_name,
+                    building_name = EXCLUDED.building_name,
+                    latitude      = EXCLUDED.latitude,
+                    longitude     = EXCLUDED.longitude,
+                    address_clean = EXCLUDED.address_clean,
+                    confidence    = EXCLUDED.confidence,
+                    manual_review = EXCLUDED.manual_review,
+                    last_updated  = EXCLUDED.last_updated
+            """, rows)
         logger.info(f"已寫入 master: {len(rows)} 筆")
 
     def summary(self) -> dict:
-        total = self.con.execute("SELECT COUNT(*) FROM master").fetchone()[0]
-        need_review = self.con.execute(
-            "SELECT COUNT(*) FROM master WHERE manual_review = TRUE"
-        ).fetchone()[0]
-        cache_size = self.con.execute("SELECT COUNT(*) FROM address_cache").fetchone()[0]
-        avg_score = self.con.execute(
-            "SELECT AVG(confidence) FROM master WHERE confidence > 0"
-        ).fetchone()[0] or 0
+        with self._lock:
+            total = self.con.execute("SELECT COUNT(*) FROM master").fetchone()[0]
+            need_review = self.con.execute(
+                "SELECT COUNT(*) FROM master WHERE manual_review = TRUE"
+            ).fetchone()[0]
+            cache_size = self.con.execute("SELECT COUNT(*) FROM address_cache").fetchone()[0]
+            avg_score = self.con.execute(
+                "SELECT AVG(confidence) FROM master WHERE confidence > 0"
+            ).fetchone()[0] or 0
         return {
             "master_total": total,
             "manual_review": need_review,
