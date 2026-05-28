@@ -24,35 +24,36 @@ API：
   注意：
   1. API 要求方括號不被 URL encode，使用手動拼接 URL 而非 httpx params。
   2. 不存在的 BRN API 回傳 400（而非空陣列），程式將 400 視為 miss。
+  3. download_batch() 完成後可透過 on_batch_hit callback 即時交給 pipeline 處理。
 """
 
 import asyncio
 import logging
 import random
-import sys
 import time
 import uuid
 from collections import deque
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import httpx
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tenacity import (
+    before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    before_sleep_log,
 )
 
 logger = logging.getLogger(__name__)
 
-# httpx 过於詳細，只顯示 WARNING 以上
- logging.getLogger("httpx").setLevel(logging.WARNING)
+# httpx 過於詳細，只顯示 WARNING 以上
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 _USER_AGENTS = deque([
@@ -136,13 +137,11 @@ class CRDownloaderBrn:
         self.cb_threshold: int = brn_cfg.get("cb_threshold", 10)
         self.cb_cooldown: float = brn_cfg.get("cb_cooldown", 60.0)
         self.request_timeout: float = cr_cfg.get("request_timeout", 30)
-        # 每隔多少筆在終端 print 一行進度（可在 config 読入）
         self.progress_every: int = brn_cfg.get("progress_every", 500)
 
         self.db = db
         self.cb = CircuitBreaker(self.cb_threshold, self.cb_cooldown)
 
-        self._write_buffer: list[dict] = []
         self._writer: pq.ParquetWriter | None = None
         self._schema: pa.Schema | None = None
         self._today_parquet: Path | None = None
@@ -221,16 +220,11 @@ class CRDownloaderBrn:
                 logger.error(f"BRN={brn} 最終失敗：{exc}")
                 return {"brn": brn, "status": "pending", "queried_at": None, "batch_id": batch_id, "records": []}
 
-    def _flush_to_parquet(self, hit_records: list[dict], batch_id: str):
-        if not hit_records:
-            return
-        today = datetime.now().strftime("%Y%m%d")
-        output_parquet = self.raw_dir / f"cr_brn_{today}.parquet"
-        self._today_parquet = output_parquet
+    def _normalize_hit_records(self, hit_records: list[dict]) -> pl.DataFrame:
+        """將 API 原始 hit records 轉為標準化 DataFrame（欄位重命名）。"""
         fetched_at = datetime.now().isoformat()
         for r in hit_records:
             r["fetched_at"] = fetched_at
-
         df = pl.DataFrame(hit_records)
         rename_map = {
             "Brn": "cr_no",
@@ -246,6 +240,16 @@ class CRDownloaderBrn:
         df = df.rename(
             {c: c.lower().replace(" ", "_").replace("-", "_") for c in df.columns if c not in existing.values()}
         )
+        return df
+
+    def _flush_to_parquet(self, hit_records: list[dict], batch_id: str):
+        if not hit_records:
+            return
+        today = datetime.now().strftime("%Y%m%d")
+        output_parquet = self.raw_dir / f"cr_brn_{today}.parquet"
+        self._today_parquet = output_parquet
+
+        df = self._normalize_hit_records(hit_records)
         arrow_batch = df.to_arrow()
         if self._writer is None:
             self._schema = arrow_batch.schema
@@ -261,7 +265,16 @@ class CRDownloaderBrn:
         self._writer.write_table(arrow_batch)
         logger.info(f"Parquet flush: {len(hit_records)} 筆 hit（batch={batch_id}）")
 
-    async def download_batch(self) -> dict:
+    async def download_batch(
+        self,
+        on_hit: Callable[[pl.DataFrame], Awaitable[None]] | None = None,
+    ) -> dict:
+        """
+        從 brn_scan_queue 抽取 pending BRN → 並發查詢 → 更新狀態。
+
+        on_hit: 可選 async callback，batch 完成後以標準化 DataFrame 呼叫。
+                pipeline 傳入此 callback 做 ALS + 寫 master。
+        """
         if self.db is None:
             raise RuntimeError("download_batch 需要 db（DBWriter）實例")
 
@@ -280,9 +293,7 @@ class CRDownloaderBrn:
         all_hit_records: list[dict] = []
         consecutive_miss = 0
         batch_stopped = False
-        done_count = 0
-        hit_count = 0
-        miss_count = 0
+        done_count = hit_count = miss_count = 0
         batch_start = time.monotonic()
 
         async with httpx.AsyncClient(http2=True) as client:
@@ -296,9 +307,6 @@ class CRDownloaderBrn:
                     hit_count += 1
                     consecutive_miss = 0
                     all_hit_records.extend(result["records"])
-                    if len(all_hit_records) >= self.batch_write:
-                        self._flush_to_parquet(all_hit_records, batch_id)
-                        all_hit_records = []
                 elif result["status"] == "miss":
                     miss_count += 1
                     consecutive_miss += 1
@@ -307,7 +315,6 @@ class CRDownloaderBrn:
                         batch_stopped = True
                         break
 
-                # 終端進度計數器（每 progress_every 筆刷新一行）
                 if done_count % self.progress_every == 0 or done_count == total_in_batch:
                     elapsed = time.monotonic() - batch_start
                     rate = done_count / elapsed if elapsed > 0 else 0
@@ -316,17 +323,24 @@ class CRDownloaderBrn:
                         f"\r[batch={batch_id}] {done_count:,}/{total_in_batch:,} "
                         f"({pct:.1f}%) | hit={hit_count:,} miss={miss_count:,} "
                         f"| {rate:.0f} BRN/s",
-                        end="", flush=True
+                        end="", flush=True,
                     )
+        print()
 
-        print()  # 換行
-
+        # 先 flush Parquet（原始備份）
         if all_hit_records:
             self._flush_to_parquet(all_hit_records, batch_id)
 
+        # 更新 brn_scan_queue 狀態
         update_records = [r for r in tasks_results if r["status"] in ("hit", "miss")]
         if update_records:
             self.db.bulk_update_brn_status(update_records)
+
+        # 立即呼叫 pipeline callback → ALS + 寫 master
+        if on_hit and all_hit_records:
+            hit_df = self._normalize_hit_records(all_hit_records)
+            logger.info(f"batch={batch_id} 觸發 on_hit callback，{len(hit_df)} 筆交給 pipeline")
+            await on_hit(hit_df)
 
         stats = {
             "total": len(tasks_results),
@@ -338,15 +352,20 @@ class CRDownloaderBrn:
         logger.info(f"=== 批次完成 batch={batch_id} === {stats}")
         return stats
 
-    async def download_all(self, resume: bool = True) -> Path:
-        total_hit = 0
-        total_miss = 0
-        batch_num = 0
-
+    async def download_all(
+        self,
+        resume: bool = True,
+        on_hit: Callable[[pl.DataFrame], Awaitable[None]] | None = None,
+    ) -> Path:
+        """
+        循環執行 download_batch 直到佇列空。
+        on_hit callback 每批有 hit 時觸發，供 pipeline 即時做 ALS + 寫 master。
+        """
+        total_hit = total_miss = batch_num = 0
         logger.info("=== download_all 開始，循環執行到佇列空 —— Ctrl+C 可安全中斷 ===")
 
         while True:
-            stats = await self.download_batch()
+            stats = await self.download_batch(on_hit=on_hit)
             if stats["total"] == 0:
                 logger.info("=== 所有 BRN 已掃描完畢 ===")
                 break
@@ -359,7 +378,6 @@ class CRDownloaderBrn:
             )
 
         self.close()
-
         if self._today_parquet is None:
             today = datetime.now().strftime("%Y%m%d")
             self._today_parquet = self.raw_dir / f"cr_brn_{today}.parquet"
