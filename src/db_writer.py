@@ -4,9 +4,10 @@ DuckDB 讀寫封裝：建表、upsert cache、寫入 master。
 
 優化:
 - 新增 get_cache_batch（批次查詢 cache，減少 DB round-trip）
-- write_master flush 門檻由 1000 提升至 5000
+- write_master flush 門溻由 1000 提升至 5000
 - init_brn_queue: numeric 模式改用 DuckDB generate_series，避免 Python 生成 1 億筆 list，速度提升 10-50x
 - master 表新增 company_type / date_of_incorporation / re_domiciliation_date 欄位
+- 新增 reset_stale_hits()：將超過 N 天的 hit 重置為 pending，供 --verify-hits 使用
 """
 
 import logging
@@ -86,7 +87,7 @@ class DBWriter:
     def __init__(self, db_path: str):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.con = duckdb.connect(db_path)
-        self._lock = threading.Lock()  # P1 #5: 保護並發寫入
+        self._lock = threading.Lock()
         self._init_tables()
 
     def _init_tables(self):
@@ -95,12 +96,11 @@ class DBWriter:
                 stmt = stmt.strip()
                 if stmt:
                     self.con.execute(stmt)
-            # 向下相容：為已存在的舊 master 表補加新欄位
             for stmt in _MIGRATE_STATEMENTS:
                 try:
                     self.con.execute(stmt)
                 except Exception:
-                    pass  # 欄位已存在時忽略
+                    pass
         logger.info("DuckDB 表初始化完成")
 
     # ---------- Cache ----------
@@ -116,10 +116,6 @@ class DBWriter:
             return dict(zip(cols, rows[0]))
 
     def get_cache_batch(self, address_hashes: list[str]) -> dict[str, dict]:
-        """
-        批次查詢 cache，一次 DB round-trip 回傳 {hash: record} 字典。
-        大幅減少 N 次單筆查詢的 overhead。
-        """
         if not address_hashes:
             return {}
         placeholders = ", ".join(["?"] * len(address_hashes))
@@ -134,7 +130,6 @@ class DBWriter:
             return {row[0]: dict(zip(cols, row)) for row in rows}
 
     def upsert_cache(self, record: dict):
-        # P1 #5: 鎖保護; P1 #6: ON CONFLICT 補全所有可變欄位
         with self._lock:
             self.con.execute("""
                 INSERT INTO address_cache
@@ -173,8 +168,6 @@ class DBWriter:
     # ---------- Raw & Master ----------
 
     def write_raw(self, df: pl.DataFrame):
-        """寫入 companies_raw（upsert by cr_no）。"""
-        # P1 #5: 鎖; P2 #9: try/finally 確保 unregister
         with self._lock:
             self.con.register("df_raw", df.to_arrow())
             try:
@@ -191,7 +184,6 @@ class DBWriter:
         logger.info(f"已寫入 companies_raw: {len(df)} 筆")
 
     def write_master(self, records: list[dict]):
-        """批次寫入 master 主檔（建議每 5000 筆呼叫一次）。"""
         if not records:
             return
         now = datetime.now().isoformat()
@@ -259,14 +251,6 @@ class DBWriter:
         prefix_end: int = 4_000_000,
         chunk_size: int = 1_000_000,
     ) -> int:
-        """
-        生成 BRN 佇列並寫入 brn_scan_queue，已存在則跳過。
-        回傳總處理筆數。
-
-        numeric 模式：使用 DuckDB generate_series + printf 向量化插入，
-                      避免在 Python 中生成 1 億筆 list，速度提升 10-50x。
-        prefix 模式：仍使用 Python 懶生成 + 分批 executemany。
-        """
         if prefixes is None:
             prefixes = ["C", "G", "L", "F", "E", "H", "N", "U", "Z", "B", "D"]
 
@@ -274,10 +258,6 @@ class DBWriter:
 
         if mode == "numeric":
             total = end - start + 1
-            logger.info(
-                f"numeric 模式：使用 DuckDB generate_series 直接寫入 "
-                f"{total:,} 筆（{start:08d}–{end:08d}）..."
-            )
             with self._lock:
                 self.con.execute(f"""
                     INSERT INTO brn_scan_queue (brn)
@@ -304,24 +284,14 @@ class DBWriter:
                     yield chunk
 
             total_inserted = 0
-            batch_num = 0
             for chunk in _iter_chunks():
                 rows = [(b,) for b in chunk]
                 with self._lock:
                     self.con.executemany(
-                        """
-                        INSERT INTO brn_scan_queue (brn)
-                        VALUES (?)
-                        ON CONFLICT (brn) DO NOTHING
-                        """,
+                        "INSERT INTO brn_scan_queue (brn) VALUES (?) ON CONFLICT (brn) DO NOTHING",
                         rows,
                     )
                 total_inserted += len(chunk)
-                batch_num += 1
-                logger.info(
-                    f"  插入批次 {batch_num}：{len(chunk):,} 筆（累計 {total_inserted:,}）"
-                )
-
             logger.info(f"init_brn_queue 完成，共處理 {total_inserted:,} 筆")
             return total_inserted
 
@@ -329,7 +299,6 @@ class DBWriter:
             raise ValueError(f"未知的 mode: {mode}")
 
     def fetch_pending_batch(self, batch_size: int = 10_000) -> list[str]:
-        """隨機抽取 pending BRN，回傳 BRN 字串 list。"""
         with self._lock:
             rows = self.con.execute(
                 """
@@ -342,11 +311,110 @@ class DBWriter:
             ).fetchall()
         return [r[0] for r in rows]
 
+    def fetch_hit_batch(self, batch_size: int = 500, older_than_days: int | None = None) -> list[str]:
+        """
+        抽取 hit 狀態的 BRN，供 --verify-hits 使用。
+        older_than_days: 只抽取超過 N 天未更新的 hit（None = 全部 hit）。
+        """
+        if older_than_days is not None:
+            sql = """
+                SELECT brn FROM brn_scan_queue
+                WHERE status = 'hit'
+                  AND queried_at < NOW() - INTERVAL ? DAY
+                ORDER BY queried_at ASC
+                LIMIT ?
+            """
+            params = [older_than_days, batch_size]
+        else:
+            sql = """
+                SELECT brn FROM brn_scan_queue
+                WHERE status = 'hit'
+                ORDER BY queried_at ASC
+                LIMIT ?
+            """
+            params = [batch_size]
+        with self._lock:
+            rows = self.con.execute(sql, params).fetchall()
+        return [r[0] for r in rows]
+
+    def upsert_verified_raw(self, cr_no: str, api_record: dict) -> str:
+        """
+        將 --verify-hits 查詢結果寫入/更新 companies_raw。
+        回傳 'updated' | 'unchanged' | 'new'。
+        """
+        address_new = (api_record.get("address_raw") or "").strip()
+        name_zh_new = (api_record.get("name_zh") or "").strip()
+        name_en_new = (api_record.get("name_en") or "").strip()
+        now = datetime.now().isoformat()
+
+        with self._lock:
+            existing = self.con.execute(
+                "SELECT name_zh, name_en, address_raw FROM companies_raw WHERE cr_no = ?",
+                [cr_no]
+            ).fetchone()
+
+        if existing is None:
+            # 全新記錄（理論上不應發生，但保安全）
+            with self._lock:
+                self.con.execute(
+                    """
+                    INSERT INTO companies_raw (cr_no, name_zh, name_en, address_raw, fetched_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (cr_no) DO UPDATE SET
+                        name_zh     = EXCLUDED.name_zh,
+                        name_en     = EXCLUDED.name_en,
+                        address_raw = EXCLUDED.address_raw,
+                        fetched_at  = EXCLUDED.fetched_at
+                    """,
+                    [cr_no, name_zh_new, name_en_new, address_new, now]
+                )
+            return "new"
+
+        old_addr = (existing[2] or "").strip()
+        old_zh   = (existing[0] or "").strip()
+        old_en   = (existing[1] or "").strip()
+        changed  = (old_addr != address_new or old_zh != name_zh_new or old_en != name_en_new)
+
+        if changed:
+            with self._lock:
+                self.con.execute(
+                    """
+                    UPDATE companies_raw
+                    SET name_zh = ?, name_en = ?, address_raw = ?, fetched_at = ?
+                    WHERE cr_no = ?
+                    """,
+                    [name_zh_new, name_en_new, address_new, now, cr_no]
+                )
+                # master 表的地址同步重置，待 --process-als 重新標準化
+                self.con.execute(
+                    """
+                    UPDATE master
+                    SET address_raw = ?, address_clean = NULL,
+                        geo_address = NULL, region = NULL, district = NULL,
+                        street_name = NULL, building_name = NULL,
+                        latitude = NULL, longitude = NULL,
+                        confidence = 0, manual_review = TRUE,
+                        last_updated = ?
+                    WHERE cr_no = ?
+                    """,
+                    [address_new, now, cr_no]
+                )
+                # brn_scan_queue 更新 queried_at
+                self.con.execute(
+                    "UPDATE brn_scan_queue SET queried_at = ? WHERE brn = ?",
+                    [now, cr_no]
+                )
+            return "updated"
+        else:
+            # 資料相同，只更新 queried_at
+            with self._lock:
+                self.con.execute(
+                    "UPDATE brn_scan_queue SET queried_at = ? WHERE brn = ?",
+                    [now, cr_no]
+                )
+            return "unchanged"
+
     def bulk_update_brn_status(self, records: list[dict]):
-        """
-        批次更新 brn_scan_queue 狀態。
-        records 格式：[{"brn": ..., "status": "hit"|"miss", "queried_at": ..., "batch_id": ...}, ...]
-        """
         if not records:
             return
         rows = [
@@ -370,7 +438,6 @@ class DBWriter:
         logger.debug(f"bulk_update_brn_status: 更新 {len(rows)} 筆")
 
     def scan_progress(self) -> dict:
-        """回傳 brn_scan_queue 進度統計。"""
         with self._lock:
             row = self.con.execute(
                 """
@@ -384,10 +451,10 @@ class DBWriter:
                 """
             ).fetchone()
         return {
-            "pending":        row[0],
-            "hit":            row[1],
-            "miss":           row[2],
-            "last_batch_id":  row[3],
+            "pending":         row[0],
+            "hit":             row[1],
+            "miss":            row[2],
+            "last_batch_id":   row[3],
             "last_queried_at": row[4],
         }
 
