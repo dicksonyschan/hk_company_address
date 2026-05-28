@@ -1,10 +1,12 @@
 cr:
+  # data.gov.hk resource: 2bbe945a-9346-4526-8dbb-b8fb4cb05aef
+  # 參數格式: query[0][key1]=Comp_name&query[0][key2]=begins_with&query[0][key3]=<prefix>&format=json
   base_url: "https://data.cr.gov.hk/cr/api/api/v1/api_builder/json/local/search"
-  page_size: 1000          # 每頁抓取筆數
-  chunk_size: 10000        # Polars streaming chunk
   raw_dir: "data/raw"
   request_timeout: 30      # 秒
-  retry_attempts: 3
+  retry_attempts: 4
+  # 注意：API 每次回傳上限 100 筆（max/skip 參數無效）
+  # 程式自動使用遞迴前綴展開策略完成全量下載
 
 als:
   base_url: "https://www.als.ogcio.gov.hk/lookup"
