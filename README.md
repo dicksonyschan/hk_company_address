@@ -10,24 +10,25 @@
 hk_company_address/
 ├── README.md
 ├── requirements.txt
-├── config.yaml              # 所有可調參數
+├── config.yaml                  # 所有可調參數（含 cr_brn 區塊）
 ├── src/
 │   ├── __init__.py
-│   ├── cr_downloader.py      # 下載 CR 公開資料
-│   ├── address_cleaner.py    # 地址前處理 / 清洗
-│   ├── als_client.py         # Async ALS API 呼叫 + cache
-│   ├── db_writer.py          # DuckDB 讀寫
-│   ├── pipeline.py           # 串接所有步驟的主流程
-│   ├── cr_industry_codes.py  # 從 data.gov.hk 下載 HSIC 代碼表
-│   └── industry_tagger.py    # 行業標籤（關鍵詞 + DeepSeek LLM）
+│   ├── cr_downloader.py          # 下載 CR 公開資料（前綴掃描模式）
+│   ├── cr_downloader_brn.py      # BRN 盲查下載器（隨機抽取掃描）
+│   ├── address_cleaner.py        # 地址前處理 / 清洗
+│   ├── als_client.py             # Async ALS API 呼叫 + cache
+│   ├── db_writer.py              # DuckDB 讀寫（含 brn_scan_queue）
+│   ├── pipeline.py               # 串接所有步驟的主流程
+│   ├── cr_industry_codes.py      # 從 data.gov.hk 下載 HSIC 代碼表
+│   └── industry_tagger.py        # 行業標籤（關鍵詞 + DeepSeek LLM）
 ├── data/
-│   ├── raw/                 # CR 原始下載 (自動建立)
-│   ├── cleaned/             # 清洗後暫存 (自動建立)
-│   └── alias_map.json       # 地址別名對照表 (可自行擴充)
+│   ├── raw/                     # CR 原始下載 (自動建立)
+│   ├── cleaned/                 # 清洗後暫存 (自動建立)
+│   └── alias_map.json           # 地址別名對照表 (可自行擴充)
 ├── tests/
-│   ├── sample_addresses.csv # 測試用地址樣本
-│   └── test_pipeline.py     # 回歸測試
-└── main.py                  # 主程式入口
+│   ├── sample_addresses.csv     # 測試用地址樣本
+│   └── test_pipeline.py         # 回歸測試（含 BRN 測試）
+└── main.py                      # 主程式入口
 ```
 
 ---
@@ -76,7 +77,8 @@ pip install -r requirements.txt
 - `als.concurrency`：ALS 同時連線數（建議 5–10）
 - `als.confidence_threshold`：低於此分數標記人工覆核（預設 70）
 - `db.path`：DuckDB 資料庫檔案路徑
-- `cr.page_size`：每次向 CR API 抓取筆數（預設 1000）
+- `cr.downloader`：下載器模式，`prefix`（前綴掃描，預設）或 `brn`（BRN 盲查）
+- `cr_brn.*`：BRN 盲查相關參數（掃描範圍、並發數、反爬設定等）
 
 ---
 
@@ -116,10 +118,84 @@ python main.py --tag-industry
 
 只處理自上次執行後 CR 新增或修改的記錄，大幅節省 API 呼叫量。
 
+> **注意**：增量模式需提供昨日 Parquet 路徑：
+> ```bash
+> python main.py --mode delta --yesterday data/raw/cr_raw_20260527.parquet
+> ```
+
 ### 單筆地址查詢（測試用）
 
 ```bash
 python main.py --lookup "九龍旺角彌敦道123號ABC大廈5樓"
+```
+
+### BRN 盲查模式
+
+透過逐筆查詢 BRN（Business Registration Number）找出未被前綴掃描涵蓋的公司記錄。
+
+**步驟一：初始化 BRN 掃描佇列（首次使用）**
+
+```bash
+# numeric 模式：掃描 00000000–99999999（約需數分鐘寫入佇列）
+python main.py --init-brn-queue
+```
+
+> 佇列資料寫入 DuckDB 的 `brn_scan_queue` 表。可重複執行，已存在的 BRN 自動跳過。
+
+**步驟二：執行 BRN 盲查**
+
+```bash
+# 每次隨機抽取 10,000 筆 pending BRN 查詢
+python main.py --mode full --downloader brn
+```
+
+- 查詢後自動更新 `hit`（有記錄）/ `miss`（無此 BRN）狀態
+- 中斷或失敗的 BRN 保持 `pending`，下次自動重試
+- 可重複排程執行，每次自動續掃
+
+**步驟三：查看掃描進度**
+
+```bash
+python main.py --scan-status
+```
+
+輸出範例：
+```
+=== BRN 佇列進度 ===
+  pending: 99850000
+  hit: 125000
+  miss: 25000
+  last_batch_id: a1b2c3d4
+  last_queried_at: 2026-05-28T10:30:00
+  scanned_pct: 0.15%
+  hit_rate_of_scanned: 83.33%
+```
+
+**步驟四：重複步驟二**（可排程，每次自動從 pending 繼續）
+
+#### config.yaml BRN 盲查設定
+
+```yaml
+cr_brn:
+  mode: numeric             # "numeric" 或 "prefix"
+
+  # numeric 模式：掃描 00000000–99999999
+  start: 0
+  end: 99999999
+
+  # prefix 模式：掃描字母前綴 + 數字
+  prefixes: ["C", "G", "L", "F", "E", "H", "N", "U", "Z", "B", "D"]
+  prefix_start: 1000000
+  prefix_end: 4000000
+
+  fetch_batch_size: 10000   # 每次隨機抽取筆數
+  concurrency: 20           # 並發查詢數
+  miss_limit: 2000          # 本批連續 miss 門檻（不終止整體掃描）
+  batch_write: 2000         # hit 記錄 Parquet flush 門檻
+  jitter_min: 0.05          # 最小 Jitter 延遲（秒）
+  jitter_max: 0.30          # 最大 Jitter 延遲（秒）
+  cb_threshold: 10          # Circuit Breaker 連續失敗門檻
+  cb_cooldown: 60           # Circuit Breaker 冷卻時間（秒）
 ```
 
 ### 回歸測試
@@ -156,6 +232,18 @@ ALS API 呼叫快取（避免重複請求）
 | geo_address | 19 字元地理地址碼 |
 | score | GeoreferencingScore |
 | fetched_at | 呼叫時間戳 |
+
+### `brn_scan_queue`
+BRN 盲查掃描佇列（由 `--init-brn-queue` 建立）
+
+| 欄位 | 說明 |
+|------|------|
+| brn | Business Registration Number（主鍵）|
+| status | `pending`（待查）/ `hit`（有結果）/ `miss`（無此 BRN）|
+| queried_at | 最後查詢時間 |
+| batch_id | 所屬批次 ID |
+
+> `miss` 即為 miss cache，與 `status='hit'` 同表管理，無需獨立 miss_cache 表。
 
 ### `master`
 最終主檔（公司名稱 → 標準化地址）

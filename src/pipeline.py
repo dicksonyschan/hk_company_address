@@ -7,6 +7,8 @@ pipeline.py
 - master records 改用 Polars 向量化組裝（取代逐行 dict append）
 - flush 門檻由 1000 提升至 5000，減少 IO 次數
 - pipeline 結束時呼叫 als.aclose() 關閉持久化 HTTP client
+- 依 config["cr"]["downloader"] 動態選擇 CRDownloader 或 CRDownloaderBrn
+- 修正 run_delta() 缺少 write_raw 的 bug（與 run_full 行為一致）
 """
 
 import asyncio
@@ -15,7 +17,6 @@ from pathlib import Path
 
 import polars as pl
 
-from .cr_downloader import CRDownloader
 from .address_cleaner import AddressCleaner
 from .als_client import ALSClient
 from .db_writer import DBWriter
@@ -40,7 +41,17 @@ class Pipeline:
         self.db = DBWriter(config["db"]["path"])
         self.cleaner = AddressCleaner(config["alias_map_path"])
         self.als = ALSClient(config, self.db)
-        self.downloader = CRDownloader(config)
+
+        # 動態選擇下載器
+        downloader_type = config.get("cr", {}).get("downloader", "prefix")
+        if downloader_type == "brn":
+            from .cr_downloader_brn import CRDownloaderBrn
+            self.downloader = CRDownloaderBrn(config, db=self.db)
+            logger.info("使用 CRDownloaderBrn（BRN 盲查模式）")
+        else:
+            from .cr_downloader import CRDownloader
+            self.downloader = CRDownloader(config)
+            logger.info(f"使用 CRDownloader（前綴掃描模式，downloader={downloader_type!r})")
 
     def _normalize_columns(self, df: pl.DataFrame) -> pl.DataFrame:
         col_map = {}
@@ -139,6 +150,10 @@ class Pipeline:
             return
 
         delta_df = self._normalize_columns(delta_df)
+
+        # 修正 bug：補加 write_raw，與 run_full 行為一致
+        self.db.write_raw(delta_df)
+
         addresses_clean = self.cleaner.clean_batch(delta_df["address_raw"].to_list())
         als_results = await self.als.process_batch(addresses_clean)
 

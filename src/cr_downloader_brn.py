@@ -1,0 +1,433 @@
+"""
+cr_downloader_brn.py
+BRN 盲查下載器：透過 BRN（Business Registration Number）逐筆查詢公司資料。
+
+策略說明：
+  - mode=numeric：掃描 00000000–99999999（8 位補零數字）
+  - mode=prefix ：掃描字母前綴 + 數字（如 C1000000–C3999999）
+  - 不使用順序掃描；每批從 brn_scan_queue 隨機抽取 pending BRN
+  - 查詢後批次更新 hit/miss 狀態
+  - 中斷安全：失敗保持 pending，下次自動重試
+
+反爬機制：
+  - User-Agent 輪換（4 個真實瀏覽器 UA）
+  - Jitter 隨機延遲
+  - 429 精確退避（讀取 Retry-After）
+  - Circuit Breaker（連續失敗熔斷）
+  - Tenacity 指數重試（最多 5 次）
+  - Referer 偽裝
+
+API：
+  GET https://data.cr.gov.hk/cr/api/api/v1/api_builder/json/local/search
+  query[0][key1]=Brn&query[0][key2]=equal&query[0][key3]=<BRN>&format=json
+"""
+
+import asyncio
+import logging
+import random
+import time
+import uuid
+from collections import deque
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+
+import httpx
+import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    before_sleep_log,
+)
+
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------ #
+# User-Agent 輪換池                                                    #
+# ------------------------------------------------------------------ #
+_USER_AGENTS = deque([
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+    "Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+])
+
+
+class CircuitBreakerState(Enum):
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+
+
+class CircuitBreaker:
+    """連續失敗熔斷器，保護目標服務。"""
+
+    def __init__(self, threshold: int = 10, cooldown: float = 60.0):
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self._failures = 0
+        self._state = CircuitBreakerState.CLOSED
+        self._opened_at: float | None = None
+
+    @property
+    def state(self) -> CircuitBreakerState:
+        if self._state == CircuitBreakerState.OPEN:
+            if time.monotonic() - self._opened_at >= self.cooldown:
+                logger.info("Circuit Breaker 冷卻完畢，回到 CLOSED")
+                self._state = CircuitBreakerState.CLOSED
+                self._failures = 0
+                self._opened_at = None
+        return self._state
+
+    def record_failure(self):
+        self._failures += 1
+        if self._failures >= self.threshold:
+            self._state = CircuitBreakerState.OPEN
+            self._opened_at = time.monotonic()
+            logger.warning(
+                f"Circuit Breaker OPEN（連續失敗 {self._failures} 次），"
+                f"冷卻 {self.cooldown}s"
+            )
+
+    def record_success(self):
+        self._failures = 0
+
+    def is_open(self) -> bool:
+        return self.state == CircuitBreakerState.OPEN
+
+
+class CRDownloaderBrn:
+    """
+    BRN 盲查下載器。
+
+    config 需包含 cr_brn 區塊（見 config.yaml）及 cr.base_url。
+    db 為 DBWriter 實例，用於 fetch_pending_batch / bulk_update_brn_status。
+    """
+
+    def __init__(self, config: dict, db=None):
+        cr_cfg = config.get("cr", {})
+        brn_cfg = config.get("cr_brn", {})
+
+        self.base_url = cr_cfg.get(
+            "base_url",
+            "https://data.cr.gov.hk/cr/api/api/v1/api_builder/json/local/search",
+        )
+        self.raw_dir = Path(cr_cfg.get("raw_dir", "data/raw"))
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+
+        self.mode: str = brn_cfg.get("mode", "numeric")
+        self.prefixes: list[str] = brn_cfg.get(
+            "prefixes", ["C", "G", "L", "F", "E", "H", "N", "U", "Z", "B", "D"]
+        )
+        self.prefix_start: int = brn_cfg.get("prefix_start", 1_000_000)
+        self.prefix_end: int = brn_cfg.get("prefix_end", 4_000_000)
+        self.start: int = brn_cfg.get("start", 0)
+        self.end: int = brn_cfg.get("end", 99_999_999)
+
+        self.fetch_batch_size: int = brn_cfg.get("fetch_batch_size", 10_000)
+        self.concurrency: int = brn_cfg.get("concurrency", 20)
+        self.miss_limit: int = brn_cfg.get("miss_limit", 2_000)
+        self.batch_write: int = brn_cfg.get("batch_write", 2_000)
+        self.jitter_min: float = brn_cfg.get("jitter_min", 0.05)
+        self.jitter_max: float = brn_cfg.get("jitter_max", 0.30)
+        self.cb_threshold: int = brn_cfg.get("cb_threshold", 10)
+        self.cb_cooldown: float = brn_cfg.get("cb_cooldown", 60.0)
+        self.request_timeout: float = cr_cfg.get("request_timeout", 30)
+
+        self.db = db
+        self.cb = CircuitBreaker(self.cb_threshold, self.cb_cooldown)
+
+        # 批次寫入 buffer
+        self._write_buffer: list[dict] = []
+        self._writer: pq.ParquetWriter | None = None
+        self._schema: pa.Schema | None = None
+
+        logger.info(
+            f"CRDownloaderBrn 初始化：mode={self.mode}, "
+            f"concurrency={self.concurrency}, batch={self.fetch_batch_size}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # 反爬：Header 輪換                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _next_headers(self) -> dict:
+        """輪換 User-Agent，加入 Referer 偽裝。"""
+        _USER_AGENTS.rotate(1)
+        return {
+            "User-Agent": _USER_AGENTS[0],
+            "Accept": "application/json",
+            "Referer": "https://www.cr.gov.hk/",
+        }
+
+    # ------------------------------------------------------------------ #
+    # 核心 API 請求（單筆 BRN）                                            #
+    # ------------------------------------------------------------------ #
+
+    async def _fetch_brn(
+        self, client: httpx.AsyncClient, brn: str
+    ) -> list[dict]:
+        """
+        查詢單筆 BRN，回傳結果 list（通常 0 或 1 筆）。
+        @retry 最多 5 次，指數退避 3–60 秒。
+        """
+
+        @retry(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=1, min=3, max=60),
+            retry=retry_if_exception_type(
+                (httpx.HTTPStatusError, httpx.TransportError, httpx.TimeoutException)
+            ),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        )
+        async def _do_fetch() -> list[dict]:
+            params = {
+                "query[0][key1]": "Brn",
+                "query[0][key2]": "equal",
+                "query[0][key3]": brn,
+                "format": "json",
+            }
+            resp = await client.get(
+                self.base_url,
+                params=params,
+                timeout=self.request_timeout,
+                headers=self._next_headers(),
+            )
+            if resp.status_code == 429:
+                retry_after = float(resp.headers.get("Retry-After", self.cb_cooldown))
+                logger.warning(f"BRN={brn} → 429，等待 {retry_after}s")
+                self.cb.record_failure()
+                await asyncio.sleep(retry_after)
+                resp.raise_for_status()  # 觸發 retry
+
+            if resp.status_code == 503:
+                logger.warning(f"BRN={brn} → 503")
+                self.cb.record_failure()
+                resp.raise_for_status()
+
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, list) else []
+
+        return await _do_fetch()
+
+    # ------------------------------------------------------------------ #
+    # 單筆查詢（含 Jitter + Circuit Breaker 檢查）                         #
+    # ------------------------------------------------------------------ #
+
+    async def _query_one(
+        self,
+        client: httpx.AsyncClient,
+        sem: asyncio.Semaphore,
+        brn: str,
+        batch_id: str,
+    ) -> dict:
+        """
+        查詢單筆 BRN，回傳狀態記錄：
+        {"brn": ..., "status": "hit"|"miss", "queried_at": ..., "batch_id": ..., "records": [...]}
+        """
+        # Circuit Breaker 檢查
+        if self.cb.is_open():
+            cooldown_remaining = self.cb.cooldown - (
+                time.monotonic() - self.cb._opened_at
+            )
+            logger.debug(
+                f"Circuit Breaker OPEN，跳過 BRN={brn}，剩餘冷卻 {cooldown_remaining:.1f}s"
+            )
+            # 不標記 miss，保持 pending 等待冷卻
+            return {"brn": brn, "status": "pending", "queried_at": None, "batch_id": batch_id, "records": []}
+
+        # Jitter 延遲
+        jitter = random.uniform(self.jitter_min, self.jitter_max)
+        await asyncio.sleep(jitter)
+
+        async with sem:
+            try:
+                records = await self._fetch_brn(client, brn)
+                self.cb.record_success()
+                status = "hit" if records else "miss"
+                logger.debug(f"BRN={brn} → {status}（{len(records)} 筆）")
+                return {
+                    "brn": brn,
+                    "status": status,
+                    "queried_at": datetime.now().isoformat(),
+                    "batch_id": batch_id,
+                    "records": records,
+                }
+            except Exception as exc:
+                self.cb.record_failure()
+                logger.error(f"BRN={brn} 最終失敗：{exc}")
+                return {
+                    "brn": brn,
+                    "status": "pending",  # 保持 pending，下次重試
+                    "queried_at": None,
+                    "batch_id": batch_id,
+                    "records": [],
+                }
+
+    # ------------------------------------------------------------------ #
+    # Parquet 串流寫入                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _flush_to_parquet(self, hit_records: list[dict], batch_id: str):
+        """將 hit 記錄追加寫入今日 Parquet 檔。"""
+        if not hit_records:
+            return
+        today = datetime.now().strftime("%Y%m%d")
+        output_parquet = self.raw_dir / f"cr_brn_{today}.parquet"
+        fetched_at = datetime.now().isoformat()
+
+        for r in hit_records:
+            r["fetched_at"] = fetched_at
+
+        df = pl.DataFrame(hit_records)
+        # 統一欄位名稱
+        rename_map = {
+            "Brn": "cr_no",
+            "Chinese_Company_Name": "name_zh",
+            "English_Company_Name": "name_en",
+            "Address_of_Registered_Office": "address_raw",
+            "Company_Type": "company_type",
+            "Date_of_Incorporation": "date_of_incorporation",
+            "Re-domiciliation_Date": "re_domiciliation_date",
+        }
+        existing = {k: v for k, v in rename_map.items() if k in df.columns}
+        df = df.rename(existing)
+        df = df.rename(
+            {c: c.lower().replace(" ", "_").replace("-", "_")
+             for c in df.columns if c not in existing.values()}
+        )
+
+        arrow_batch = df.to_arrow()
+        if self._writer is None:
+            self._schema = arrow_batch.schema
+            self._writer = pq.ParquetWriter(
+                output_parquet, self._schema, compression="snappy"
+            )
+        else:
+            try:
+                arrow_batch = arrow_batch.cast(self._schema)
+            except Exception:
+                for field in self._schema:
+                    if field.name not in df.columns:
+                        df = df.with_columns(
+                            pl.lit(None).cast(pl.Utf8).alias(field.name)
+                        )
+                arrow_batch = df.select(
+                    [f.name for f in self._schema]
+                ).to_arrow().cast(self._schema)
+
+        self._writer.write_table(arrow_batch)
+        logger.info(f"Parquet flush: {len(hit_records)} 筆 hit（batch={batch_id}）")
+
+    # ------------------------------------------------------------------ #
+    # 主入口：批次下載                                                      #
+    # ------------------------------------------------------------------ #
+
+    async def download_batch(self) -> dict:
+        """
+        從 brn_scan_queue 隨機抽取 pending BRN → 並發查詢 → 更新狀態。
+        回傳本批統計 {"total": N, "hit": N, "miss": N, "skipped": N}。
+        """
+        if self.db is None:
+            raise RuntimeError("download_batch 需要 db（DBWriter）實例")
+
+        batch_id = str(uuid.uuid4())[:8]
+        pending_brns = self.db.fetch_pending_batch(self.fetch_batch_size)
+
+        if not pending_brns:
+            logger.info("brn_scan_queue 中無 pending BRN，批次結束")
+            return {"total": 0, "hit": 0, "miss": 0, "skipped": 0}
+
+        logger.info(
+            f"=== BRN 批次開始 batch={batch_id}，取得 {len(pending_brns)} 筆 pending ==="
+        )
+
+        sem = asyncio.Semaphore(self.concurrency)
+        tasks_results: list[dict] = []
+        all_hit_records: list[dict] = []
+
+        # 本批連續 miss 計數器
+        consecutive_miss = 0
+        batch_stopped = False
+
+        async with httpx.AsyncClient(http2=True) as client:
+            tasks = [
+                self._query_one(client, sem, brn, batch_id)
+                for brn in pending_brns
+            ]
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                tasks_results.append(result)
+
+                if result["status"] == "hit":
+                    consecutive_miss = 0
+                    all_hit_records.extend(result["records"])
+                    # batch_write 門檻觸發 Parquet flush
+                    if len(all_hit_records) >= self.batch_write:
+                        self._flush_to_parquet(all_hit_records, batch_id)
+                        all_hit_records = []
+                elif result["status"] == "miss":
+                    consecutive_miss += 1
+                    if consecutive_miss >= self.miss_limit:
+                        logger.info(
+                            f"本批連續 miss {consecutive_miss} 次達到門檻 "
+                            f"({self.miss_limit})，停止本批（不影響整體掃描）"
+                        )
+                        batch_stopped = True
+                        break
+
+        # 剩餘 hit records flush
+        if all_hit_records:
+            self._flush_to_parquet(all_hit_records, batch_id)
+
+        # 批次更新 DB 狀態
+        update_records = [
+            r for r in tasks_results if r["status"] in ("hit", "miss")
+        ]
+        if update_records:
+            self.db.bulk_update_brn_status(update_records)
+
+        stats = {
+            "total": len(tasks_results),
+            "hit": sum(1 for r in tasks_results if r["status"] == "hit"),
+            "miss": sum(1 for r in tasks_results if r["status"] == "miss"),
+            "skipped": sum(1 for r in tasks_results if r["status"] == "pending"),
+            "batch_stopped_early": batch_stopped,
+        }
+        logger.info(f"=== 批次完成 batch={batch_id} === {stats}")
+        return stats
+
+    # ------------------------------------------------------------------ #
+    # 與現有 CRDownloader 兼容介面                                          #
+    # ------------------------------------------------------------------ #
+
+    def get_delta(self, yesterday_parquet: Path, today_parquet: Path) -> pl.DataFrame:
+        """增量比較介面（與 CRDownloader 相同）。"""
+        keep_cols = ["cr_no", "name_zh", "name_en", "address_raw"]
+
+        def safe_select(path: Path) -> pl.DataFrame:
+            df = pl.read_parquet(path)
+            cols = [c for c in keep_cols if c in df.columns]
+            return df.select(cols)
+
+        old = safe_select(yesterday_parquet)
+        new = safe_select(today_parquet)
+        join_on = [c for c in keep_cols if c in old.columns and c in new.columns]
+        delta = new.join(old, on=join_on, how="anti")
+        logger.info(f"增量: {len(delta)} 筆新增/變動")
+        return delta
+
+    def close(self):
+        """關閉 Parquet writer。"""
+        if self._writer:
+            self._writer.close()
+            self._writer = None

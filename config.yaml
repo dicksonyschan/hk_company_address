@@ -5,8 +5,31 @@ cr:
   raw_dir: "data/raw"
   request_timeout: 30      # 秒
   retry_attempts: 4
+  downloader: prefix        # "prefix"=前綴掃描（預設）, "brn"=BRN 盲查
   # 注意：API 每次回傳上限 100 筆（max/skip 參數無效）
   # 程式自動使用遞迴前綴展開策略完成全量下載
+
+cr_brn:
+  mode: numeric             # "numeric" 或 "prefix"
+
+  # numeric 模式
+  start: 0
+  end: 99999999
+
+  # prefix 模式
+  prefixes: ["C", "G", "L", "F", "E", "H", "N", "U", "Z", "B", "D"]
+  prefix_start: 1000000
+  prefix_end: 4000000
+
+  # 共用參數
+  fetch_batch_size: 10000   # 每次執行隨機抽取筆數
+  concurrency: 20           # 並發查詢數
+  miss_limit: 2000          # 本批連續 miss 門檻（不終止整體掃描）
+  batch_write: 2000         # hit 記錄 Parquet flush 門檻
+  jitter_min: 0.05          # 最小 Jitter 延遲（秒）
+  jitter_max: 0.30          # 最大 Jitter 延遲（秒）
+  cb_threshold: 10          # Circuit Breaker 連續失敗門檻
+  cb_cooldown: 60           # Circuit Breaker 冷卻時間（秒）
 
 als:
   base_url: "https://www.als.ogcio.gov.hk/lookup"
