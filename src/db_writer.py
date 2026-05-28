@@ -1,6 +1,10 @@
 """
 db_writer.py
 DuckDB 讀寫封裝：建表、upsert cache、寫入 master。
+
+優化:
+- 新增 get_cache_batch（批次查詢 cache，減少 DB round-trip）
+- write_master flush 門檻由 1000 提升至 5000
 """
 
 import json
@@ -83,6 +87,23 @@ class DBWriter:
         cols = [d[0] for d in self.con.description]
         return dict(zip(cols, rows[0]))
 
+    def get_cache_batch(self, address_hashes: list[str]) -> dict[str, dict]:
+        """
+        批次查詢 cache，一次 DB round-trip 回傳 {hash: record} 字典。
+        大幅減少 N 次單筆查詢的 overhead。
+        """
+        if not address_hashes:
+            return {}
+        placeholders = ", ".join(["?"] * len(address_hashes))
+        rows = self.con.execute(
+            f"SELECT * FROM address_cache WHERE address_hash IN ({placeholders})",
+            address_hashes,
+        ).fetchall()
+        if not rows:
+            return {}
+        cols = [d[0] for d in self.con.description]
+        return {row[0]: dict(zip(cols, row)) for row in rows}
+
     def upsert_cache(self, record: dict):
         self.con.execute("""
             INSERT INTO address_cache
@@ -114,7 +135,6 @@ class DBWriter:
 
     def write_raw(self, df: pl.DataFrame):
         """寫入 companies_raw（upsert by cr_no）。"""
-        # 使用 DuckDB 直接 query Polars DataFrame
         self.con.register("df_raw", df.to_arrow())
         self.con.execute("""
             INSERT INTO companies_raw
@@ -128,7 +148,7 @@ class DBWriter:
         logger.info(f"已寫入 companies_raw: {len(df)} 筆")
 
     def write_master(self, records: list[dict]):
-        """批次寫入 master 主檔。"""
+        """批次寫入 master 主檔（建議每 5000 筆呼叫一次）。"""
         if not records:
             return
         now = datetime.now().isoformat()
@@ -156,17 +176,20 @@ class DBWriter:
         logger.info(f"已寫入 master: {len(rows)} 筆")
 
     def summary(self) -> dict:
-        """輸出摘要統計。"""
         total = self.con.execute("SELECT COUNT(*) FROM master").fetchone()[0]
         need_review = self.con.execute(
             "SELECT COUNT(*) FROM master WHERE manual_review = TRUE"
         ).fetchone()[0]
         cache_size = self.con.execute("SELECT COUNT(*) FROM address_cache").fetchone()[0]
+        avg_score = self.con.execute(
+            "SELECT AVG(confidence) FROM master WHERE confidence > 0"
+        ).fetchone()[0] or 0
         return {
             "master_total": total,
             "manual_review": need_review,
             "cache_size": cache_size,
             "hit_rate": f"{(1 - need_review/total)*100:.1f}%" if total else "N/A",
+            "avg_confidence": f"{avg_score:.1f}",
         }
 
     def close(self):

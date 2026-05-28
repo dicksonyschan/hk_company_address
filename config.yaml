@@ -8,8 +8,8 @@ cr:
 
 als:
   base_url: "https://www.als.ogcio.gov.hk/lookup"
-  concurrency: 8           # 同時連線數 (建議 5-10)
-  rate_limit: 15           # 每秒最大請求數
+  concurrency: 10          # 同時連線數（提升至 10）
+  rate_limit: 20           # 每秒最大請求數（提升至 20）
   confidence_threshold: 70 # 低於此分數標記人工覆核
   request_timeout: 5       # 秒
   retry_attempts: 3

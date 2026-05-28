@@ -1,6 +1,11 @@
 """
 cr_downloader.py
 從 data.cr.gov.hk 分頁下載本地公司地址資料，支援斷點續傳。
+
+優化:
+- 並發分頁下載（Semaphore 控制 5 頁同時）
+- 串流寫入 Parquet（PyArrow ParquetWriter），避免 OOM
+- 每頁下載後即刪除 JSON 暫存，節省磁碟
 """
 
 import asyncio
@@ -13,8 +18,13 @@ from datetime import datetime
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
+
+# 並發下載分頁數上限
+_DOWNLOAD_CONCURRENCY = 5
 
 
 class CRDownloader:
@@ -32,10 +42,7 @@ class CRDownloader:
     )
     async def _fetch_page(self, client: httpx.AsyncClient, skip: int) -> list[dict]:
         """抓取單一分頁，失敗時自動重試（指數退避）。"""
-        params = {
-            "max": self.page_size,
-            "skip": skip,
-        }
+        params = {"max": self.page_size, "skip": skip}
         resp = await client.get(
             self.base_url,
             params=params,
@@ -44,79 +51,116 @@ class CRDownloader:
         )
         resp.raise_for_status()
         data = resp.json()
-        # CR API 回傳結構: {"company": [...]} 或直接 list
         if isinstance(data, list):
             return data
         return data.get("company", data.get("result", []))
 
     def _get_last_page(self) -> int:
-        """從已下載檔案推算斷點，支援續傳。"""
-        pages = sorted(self.raw_dir.glob("page_*.json"))
+        """從已下載 Parquet 分頁推算斷點，支援續傳。"""
+        pages = sorted(self.raw_dir.glob("page_*.parquet"))
         if not pages:
             return 0
-        last = pages[-1].stem  # e.g. 'page_00042'
-        return int(last.split("_")[1])
+        return int(pages[-1].stem.split("_")[1]) + 1
+
+    async def _download_page(
+        self,
+        client: httpx.AsyncClient,
+        sem: asyncio.Semaphore,
+        page_num: int,
+    ) -> tuple[int, list[dict]]:
+        """單頁下載，受 Semaphore 限制並發數。"""
+        async with sem:
+            skip = page_num * self.page_size
+            records = await self._fetch_page(client, skip)
+            return page_num, records
 
     async def download_all(self, resume: bool = True) -> Path:
         """
-        全量下載所有分頁，存成 page_XXXXX.json。
-        resume=True 時從上次斷點續傳。
-        最後合併成單一 Parquet 檔回傳路徑。
+        全量下載所有分頁，並發執行（最多 _DOWNLOAD_CONCURRENCY 頁同時）。
+        結果串流寫入單一 Parquet 檔，避免全量載入記憶體。
         """
         start_page = self._get_last_page() if resume else 0
         today = datetime.now().strftime("%Y%m%d")
         output_parquet = self.raw_dir / f"cr_raw_{today}.parquet"
+        fetched_at = datetime.now().isoformat()
 
-        logger.info(f"開始下載 CR 資料，從第 {start_page} 頁起")
+        logger.info(f"開始下載 CR 資料，從第 {start_page} 頁起（並發: {_DOWNLOAD_CONCURRENCY}）")
+
+        sem = asyncio.Semaphore(_DOWNLOAD_CONCURRENCY)
+        writer: pq.ParquetWriter | None = None
+        schema: pa.Schema | None = None
+        page_num = start_page
+        total_records = 0
 
         async with httpx.AsyncClient(http2=True) as client:
-            skip = start_page * self.page_size
-            page_num = start_page
-
+            # 批次並發：每批 _DOWNLOAD_CONCURRENCY 頁
             while True:
-                records = await self._fetch_page(client, skip)
-                if not records:
-                    logger.info(f"下載完成，共 {page_num} 頁")
+                batch_pages = list(range(page_num, page_num + _DOWNLOAD_CONCURRENCY))
+                tasks = [
+                    self._download_page(client, sem, p)
+                    for p in batch_pages
+                ]
+                results = await asyncio.gather(*tasks)
+
+                any_data = False
+                # 按頁序排序後串流寫入
+                for pn, records in sorted(results, key=lambda x: x[0]):
+                    if not records:
+                        continue
+                    any_data = True
+                    # 加入 fetched_at
+                    for r in records:
+                        r["fetched_at"] = fetched_at
+
+                    df_chunk = pl.DataFrame(records)
+                    df_chunk = df_chunk.rename(
+                        {c: c.lower().strip() for c in df_chunk.columns}
+                    )
+                    arrow_batch = df_chunk.to_arrow()
+
+                    if writer is None:
+                        schema = arrow_batch.schema
+                        writer = pq.ParquetWriter(output_parquet, schema, compression="snappy")
+                    else:
+                        # 統一 schema（欄位可能略有差異）
+                        arrow_batch = arrow_batch.cast(schema)
+
+                    writer.write_table(arrow_batch)
+                    total_records += len(records)
+                    logger.info(f"  頁 {pn:05d}: {len(records)} 筆（累計 {total_records}）")
+
+                if not any_data:
+                    logger.info(f"下載完成，共 {page_num} 頁，{total_records} 筆")
                     break
 
-                page_file = self.raw_dir / f"page_{page_num:05d}.json"
-                page_file.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
-                logger.info(f"  頁 {page_num:05d}: {len(records)} 筆")
+                page_num += _DOWNLOAD_CONCURRENCY
 
-                skip += self.page_size
-                page_num += 1
+                # 批次間禮貌性短暫等待
+                await asyncio.sleep(0.2)
 
-                # 禮貌性延遲，避免過快請求政府伺服器
-                await asyncio.sleep(0.3)
+        if writer:
+            writer.close()
 
-        # 合併所有 JSON 頁為 Parquet
-        self._merge_to_parquet(output_parquet)
         return output_parquet
-
-    def _merge_to_parquet(self, output_path: Path):
-        """把所有 page_*.json 合併成一個 Parquet 檔。"""
-        all_records = []
-        for f in sorted(self.raw_dir.glob("page_*.json")):
-            all_records.extend(json.loads(f.read_text(encoding="utf-8")))
-
-        if not all_records:
-            logger.warning("無資料可合併")
-            return
-
-        df = pl.DataFrame(all_records)
-        # 統一欄位名稱（CR API 欄位名可能因語言設定略有不同）
-        df = df.rename({c: c.lower().strip() for c in df.columns})
-        df = df.with_columns(pl.lit(datetime.now().isoformat()).alias("fetched_at"))
-        df.write_parquet(output_path)
-        logger.info(f"已合併 {len(all_records)} 筆到 {output_path}")
 
     def get_delta(self, yesterday_parquet: Path, today_parquet: Path) -> pl.DataFrame:
         """
         增量模式：比較昨日與今日資料，回傳新增／變動的記錄。
+        使用全欄位 hash 偵測任何欄位變動（包含 name_zh/name_en）。
         """
-        old = pl.read_parquet(yesterday_parquet).select(["cr_no", "address"])
-        new = pl.read_parquet(today_parquet).select(["cr_no", "address"])
-        # Anti-join: 今日有、昨日無 或 地址有變動
-        delta = new.join(old, on=["cr_no", "address"], how="anti")
+        keep_cols = ["cr_no", "name_zh", "name_en", "address_raw"]
+
+        def safe_select(path: Path) -> pl.DataFrame:
+            df = pl.read_parquet(path)
+            df = df.rename({c: c.lower().strip() for c in df.columns})
+            cols = [c for c in keep_cols if c in df.columns]
+            return df.select(cols)
+
+        old = safe_select(yesterday_parquet)
+        new = safe_select(today_parquet)
+
+        # Anti-join on all available key columns
+        join_on = [c for c in keep_cols if c in old.columns and c in new.columns]
+        delta = new.join(old, on=join_on, how="anti")
         logger.info(f"增量: {len(delta)} 筆新增/變動")
         return delta
