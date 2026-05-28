@@ -2,15 +2,20 @@
 main.py
 主程式入口，支援 CLI 參數。
 
-用法:
+BRN 模式建議兩階段實復：
+  階段 1：下載 CR 資料（只存 raw，不呼 ALS）
+    python main.py --mode full --downloader brn
+
+  階段 2：獨立地址處理（可多次執行，支援斷點繼續）
+    python main.py --process-als
+
+其他用法：
   python main.py --mode full              # 全量（前綴掃描）
   python main.py --mode delta --yesterday data/raw/cr_raw_20260527.parquet
-  python main.py --lookup "290-296 UN CHAU STREET CHEUNG SHA WAN"  # 單筆查詢
+  python main.py --lookup "290 UN CHAU STREET CHEUNG SHA WAN"  # 單筆查詢
   python main.py --init-brn-queue         # 初始化 BRN 佇列
-  python main.py --mode full --downloader brn  # BRN 盲查模式
   python main.py --scan-status            # 查看 BRN 掃描進度
-  python main.py --test-brn               # 渫渫模式：指定 BRN 範圍一鍵渫渫
-  python main.py --test-brn --brn-start 71807826 --brn-end 71807828
+  python main.py --test-brn               # 渫渫：指定 BRN 範圍一鍵渫渫
 """
 
 import asyncio
@@ -49,33 +54,37 @@ def setup_logging(config: dict):
 @click.option("--lookup", default=None,
               help="單筆地址查詢（渫渫用）")
 @click.option("--init-hsic", is_flag=True, default=False,
-              help="載入 HSIC 行業代碼表（從 data.gov.hk 下載）")
+              help="載入 HSIC 行業代碼表")
 @click.option("--tag-industry", is_flag=True, default=False,
-              help="對 master 表執行行業標籤（完成 --init-hsic 後使用）")
+              help="對 master 表執行行業標籤")
 @click.option("--downloader", type=click.Choice(["prefix", "brn"]), default="prefix",
-              help="下載器類型：prefix=前綴掃描（預設）, brn=BRN 盲查")
+              help="下載器類型")
 @click.option("--init-brn-queue", is_flag=True, default=False,
-              help="初始化 brn_scan_queue 佇列（首次執行，numeric 模式約需數分鐘）")
+              help="初始化 brn_scan_queue 佇列")
 @click.option("--scan-status", is_flag=True, default=False,
-              help="印出 brn_scan_queue 的 pending/hit/miss 統計")
+              help="印出 brn_scan_queue 進度統計")
+@click.option("--process-als", "process_als", is_flag=True, default=False,
+              help="獨立 ALS 地址處理：從 companies_raw 讀取尚未處理的記錄寫入 master")
+@click.option("--als-batch-size", default=500, show_default=True,
+              help="--process-als 每批處理筆數")
 @click.option("--test-brn", is_flag=True, default=False,
-              help="渫渫模式：對指定 BRN 範圍執行完整流程（初始化 -> 查 CR -> ALS -> 寫 master）")
+              help="渫渫模式：對指定 BRN 範圍執行完整流程")
 @click.option("--brn-start", default="71807826",
-              help="--test-brn 範圍起始 BRN（預設: 71807826）")
+              help="--test-brn 起始 BRN（預設: 71807826）")
 @click.option("--brn-end", default="71807828",
-              help="--test-brn 範圍結束 BRN（預設: 71807828）")
+              help="--test-brn 結束 BRN（預設: 71807828）")
 @click.option("--config", "config_path", default="config.yaml",
               help="設定檔路徑")
-def main(mode: str, yesterday: str, lookup: str,
-         init_hsic: bool, tag_industry: bool,
-         downloader: str, init_brn_queue: bool, scan_status: bool,
-         test_brn: bool, brn_start: str, brn_end: str,
-         config_path: str):
+def main(mode, yesterday, lookup,
+         init_hsic, tag_industry,
+         downloader, init_brn_queue, scan_status,
+         process_als, als_batch_size,
+         test_brn, brn_start, brn_end,
+         config_path):
     config = load_config(config_path)
     setup_logging(config)
     logger = logging.getLogger("main")
 
-    # 將 downloader 選項注入 config
     config.setdefault("cr", {})["downloader"] = downloader
 
     # --test-brn 渫渫模式
@@ -83,7 +92,23 @@ def main(mode: str, yesterday: str, lookup: str,
         asyncio.run(_run_test_brn(config, brn_start, brn_end, logger))
         return
 
-    # 單筆查詢模式
+    # --process-als 獨立 ALS 處理
+    if process_als:
+        from src.pipeline import Pipeline
+        pipeline = Pipeline(config)
+        try:
+            summary = asyncio.run(pipeline.process_als_from_raw(batch_size=als_batch_size))
+            if summary:
+                print("\n=== ALS 處理摘要 ===")
+                for k, v in summary.items():
+                    print(f"  {k}: {v}")
+        except KeyboardInterrupt:
+            logger.info("使用者中斷，已處理的記錄已儲存")
+        finally:
+            pipeline.close()
+        return
+
+    # --lookup 單筆查詢
     if lookup:
         from src.address_cleaner import AddressCleaner
         from src.db_writer import DBWriter
@@ -112,7 +137,7 @@ def main(mode: str, yesterday: str, lookup: str,
         db.close()
         return
 
-    # --init-brn-queue 模式
+    # --init-brn-queue
     if init_brn_queue:
         from src.db_writer import DBWriter
         brn_cfg = config.get("cr_brn", {})
@@ -131,7 +156,7 @@ def main(mode: str, yesterday: str, lookup: str,
         db.close()
         return
 
-    # --scan-status 模式
+    # --scan-status
     if scan_status:
         from src.db_writer import DBWriter
         db = DBWriter(config["db"]["path"])
@@ -148,7 +173,7 @@ def main(mode: str, yesterday: str, lookup: str,
         db.close()
         return
 
-    # --init-hsic 模式
+    # --init-hsic
     if init_hsic:
         from src.cr_industry_codes import CRIndustryCodes
         logger.info("=== 載入 HSIC 行業代碼表 ===")
@@ -157,7 +182,7 @@ def main(mode: str, yesterday: str, lookup: str,
         logger.info("=== HSIC 載入完成 ===")
         return
 
-    # --tag-industry 模式
+    # --tag-industry
     if tag_industry:
         from src.industry_tagger import IndustryTagger
         industry_cfg = config.get("industry", {})
@@ -173,7 +198,6 @@ def main(mode: str, yesterday: str, lookup: str,
     # 全量 / 增量模式
     from src.pipeline import Pipeline
     pipeline = Pipeline(config)
-
     try:
         if mode == "full":
             asyncio.run(pipeline.run_full())
@@ -191,10 +215,10 @@ async def _run_test_brn(config: dict, brn_start: str, brn_end: str, logger):
     """
     渫渫模式：對指定 BRN 範圍執行完整流程。
     步驟：
-      1. 初始化 DBWriter（建表）
-      2. 將指定 BRN 範圍寫入 brn_scan_queue（pending）
-      3. 建立 CRDownloaderBrn 查詢 CR API
-      4. 對每個 hit 執行 AddressCleaner + ALSClient
+      1. 初始化 DBWriter
+      2. 將指定 BRN 寫入 brn_scan_queue
+      3. CRDownloaderBrn 查詢 CR API
+      4. AddressCleaner + ALSClient
       5. 寫入 master 表
       6. 印出摘要
     """
@@ -205,7 +229,6 @@ async def _run_test_brn(config: dict, brn_start: str, brn_end: str, logger):
 
     logger.info(f"=== 渫渫模式: BRN {brn_start} – {brn_end} ===")
 
-    # 解析 BRN 範圍（支援數字型和字母前綴型）
     def _parse_brn(s: str):
         s = s.strip().upper()
         if _re.match(r'^\d+$', s):
@@ -215,22 +238,13 @@ async def _run_test_brn(config: dict, brn_start: str, brn_end: str, logger):
     start_val, start_type = _parse_brn(brn_start)
     end_val, end_type = _parse_brn(brn_end)
 
-    # --- 步驟 1: 初始化 DB ---
     db = DBWriter(config["db"]["path"])
     logger.info("[1/5] DuckDB 建表完成")
 
-    # --- 步驟 2: 寫入指定 BRN 到 brn_scan_queue ---
     if start_type == "numeric" and end_type == "numeric":
-        total_q = db.init_brn_queue(
-            mode="numeric",
-            start=int(start_val),
-            end=int(end_val),
-        )
+        total_q = db.init_brn_queue(mode="numeric", start=int(start_val), end=int(end_val))
     else:
-        # 字母前綴型：建立臨時 list
-        brn_list = [brn_start.upper()]
-        if brn_start.upper() != brn_end.upper():
-            brn_list.append(brn_end.upper())
+        brn_list = list({brn_start.upper(), brn_end.upper()})
         rows = [(b,) for b in brn_list]
         db.con.executemany(
             "INSERT INTO brn_scan_queue (brn) VALUES (?) ON CONFLICT (brn) DO NOTHING",
@@ -240,23 +254,20 @@ async def _run_test_brn(config: dict, brn_start: str, brn_end: str, logger):
 
     logger.info(f"[2/5] brn_scan_queue 寫入 {total_q} 筆 BRN pending")
 
-    # --- 步驟 3: 查詢 CR API ---
     from src.cr_downloader_brn import CRDownloaderBrn
 
-    hit_records = []  # [(brn, record_dict), ...]
+    hit_records = []
 
     async def on_hit(df):
-        """CRDownloaderBrn 每批 hit 回調，收集 hit 資料。"""
         for row in df.to_dicts():
             hit_records.append(row)
 
     cr_config = dict(config)
     cr_config.setdefault("cr", {})["downloader"] = "brn"
-    # 渫渫模式下降低並發數和 miss 門檻
     brn_cfg_override = dict(config.get("cr_brn", {}))
-    brn_cfg_override["fetch_batch_size"] = total_q  # 一次抽完所有筆
+    brn_cfg_override["fetch_batch_size"] = total_q
     brn_cfg_override["concurrency"] = min(5, total_q)
-    brn_cfg_override["miss_limit"] = total_q + 1    # 不提前終止
+    brn_cfg_override["miss_limit"] = total_q + 1
     cr_config["cr_brn"] = brn_cfg_override
 
     downloader = CRDownloaderBrn(cr_config, db=db)
@@ -268,11 +279,9 @@ async def _run_test_brn(config: dict, brn_start: str, brn_end: str, logger):
         db.close()
         return
 
-    # --- 步驟 4: 地址清洗 + ALS 標準化 ---
     import polars as pl
     df_hits = pl.DataFrame(hit_records)
 
-    # 欄位名稱正規化
     CR_FIELD_MAP = {
         "companyno": "cr_no", "company_no": "cr_no",
         "namechinese": "name_zh", "nameenglish": "name_en",
@@ -289,35 +298,33 @@ async def _run_test_brn(config: dict, brn_start: str, brn_end: str, logger):
     db.write_raw(df_hits)
 
     cleaner = AddressCleaner(config["alias_map_path"])
-    als = ALSClient(config, db)
+    als_client = ALSClient(config, db)
 
     addresses_clean = cleaner.clean_batch(df_hits["address_raw"].to_list())
     logger.info(f"[4/5] 地址清洗完成，送交 ALS 標準化...")
-    als_results = await als.process_batch(addresses_clean)
-    await als.aclose()
+    als_results = await als_client.process_batch(addresses_clean)
+    await als_client.aclose()
 
-    # --- 步驟 5: 寫入 master ---
     als_cols = ["geo_address", "region", "district", "street_name",
                 "building_name", "latitude", "longitude", "score", "manual_review"]
     extra_cols = ["company_type", "date_of_incorporation", "re_domiciliation_date"]
 
     master_records = []
     for i, row in enumerate(df_hits.to_dicts()):
-        als = als_results[i] or {}
+        r = als_results[i] or {}
         master_records.append({
             "cr_no":         row.get("cr_no"),
             "name_zh":       row.get("name_zh"),
             "name_en":       row.get("name_en"),
             "address_raw":   row.get("address_raw"),
             "address_clean": addresses_clean[i],
-            **{k: als.get(k) for k in als_cols},
+            **{k: r.get(k) for k in als_cols},
             **{k: row.get(k) for k in extra_cols},
         })
 
     db.write_master(master_records)
     logger.info(f"[5/5] master 寫入完成，{len(master_records)} 筆")
 
-    # --- 步驟 6: 印出摘要 ---
     summary = db.summary()
     db.close()
 
