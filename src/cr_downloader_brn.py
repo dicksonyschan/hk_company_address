@@ -20,6 +20,8 @@ BRN 盲查下載器：透過 BRN（Business Registration Number）逐筆查詢�
 API：
   GET https://data.cr.gov.hk/cr/api/api/v1/api_builder/json/local/search
   query[0][key1]=Brn&query[0][key2]=equal&query[0][key3]=<BRN>&format=json
+
+  注意：API 要求方括號不被 URL encode，使用手動拼接 URL 而非 httpx params 。
 """
 
 import asyncio
@@ -46,9 +48,6 @@ from tenacity import (
 
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------ #
-# User-Agent 輪換池                                                    #
-# ------------------------------------------------------------------ #
 _USER_AGENTS = deque([
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -67,8 +66,6 @@ class CircuitBreakerState(Enum):
 
 
 class CircuitBreaker:
-    """連續失敗熱斷器，保護目標服務。"""
-
     def __init__(self, threshold: int = 10, cooldown: float = 60.0):
         self.threshold = threshold
         self.cooldown = cooldown
@@ -92,8 +89,7 @@ class CircuitBreaker:
             self._state = CircuitBreakerState.OPEN
             self._opened_at = time.monotonic()
             logger.warning(
-                f"Circuit Breaker OPEN（連續失敗 {self._failures} 次），"
-                f"冷卻 {self.cooldown}s"
+                f"Circuit Breaker OPEN（連續失敗 {self._failures} 次），冷卻 {self.cooldown}s"
             )
 
     def record_success(self):
@@ -104,13 +100,6 @@ class CircuitBreaker:
 
 
 class CRDownloaderBrn:
-    """
-    BRN 盲查下載器。
-
-    config 需包含 cr_brn 區塊（見 config.yaml）及 cr.base_url。
-    db 為 DBWriter 實例，用於 fetch_pending_batch / bulk_update_brn_status。
-    """
-
     def __init__(self, config: dict, db=None):
         cr_cfg = config.get("cr", {})
         brn_cfg = config.get("cr_brn", {})
@@ -144,7 +133,6 @@ class CRDownloaderBrn:
         self.db = db
         self.cb = CircuitBreaker(self.cb_threshold, self.cb_cooldown)
 
-        # 批次寫入 buffer
         self._write_buffer: list[dict] = []
         self._writer: pq.ParquetWriter | None = None
         self._schema: pa.Schema | None = None
@@ -155,12 +143,7 @@ class CRDownloaderBrn:
             f"concurrency={self.concurrency}, batch={self.fetch_batch_size}"
         )
 
-    # ------------------------------------------------------------------ #
-    # 反結：Header 輪換                                                    #
-    # ------------------------------------------------------------------ #
-
     def _next_headers(self) -> dict:
-        """輪換 User-Agent，加入 Referer 偽裝。"""
         _USER_AGENTS.rotate(1)
         return {
             "User-Agent": _USER_AGENTS[0],
@@ -168,18 +151,20 @@ class CRDownloaderBrn:
             "Referer": "https://www.cr.gov.hk/",
         }
 
-    # ------------------------------------------------------------------ #
-    # 核心 API 請求（單筆 BRN）                                            #
-    # ------------------------------------------------------------------ #
-
-    async def _fetch_brn(
-        self, client: httpx.AsyncClient, brn: str
-    ) -> list[dict]:
+    def _build_url(self, brn: str) -> str:
         """
-        查詢單筆 BRN，回傳結果 list（通常 0 或 1 筆）。
-        @retry 最多 5 次，指數退避 3–60 秒。
+        手動拼接 URL，保留方括號不被 encode。
+        CR API 要求 query[0][key1] 格式，httpx 預設會將 [ ] encode 成 %5B %5D。
         """
+        return (
+            f"{self.base_url}"
+            f"?query[0][key1]=Brn"
+            f"&query[0][key2]=equal"
+            f"&query[0][key3]={brn}"
+            f"&format=json"
+        )
 
+    async def _fetch_brn(self, client: httpx.AsyncClient, brn: str) -> list[dict]:
         @retry(
             stop=stop_after_attempt(5),
             wait=wait_exponential(multiplier=1, min=3, max=60),
@@ -190,15 +175,9 @@ class CRDownloaderBrn:
             reraise=True,
         )
         async def _do_fetch() -> list[dict]:
-            params = {
-                "query[0][key1]": "Brn",
-                "query[0][key2]": "equal",
-                "query[0][key3]": brn,
-                "format": "json",
-            }
+            url = self._build_url(brn)  # 手動拼 URL，不經 httpx params encode
             resp = await client.get(
-                self.base_url,
-                params=params,
+                url,
                 timeout=self.request_timeout,
                 headers=self._next_headers(),
             )
@@ -208,21 +187,15 @@ class CRDownloaderBrn:
                 self.cb.record_failure()
                 await asyncio.sleep(retry_after)
                 resp.raise_for_status()
-
             if resp.status_code == 503:
                 logger.warning(f"BRN={brn} → 503")
                 self.cb.record_failure()
                 resp.raise_for_status()
-
             resp.raise_for_status()
             data = resp.json()
             return data if isinstance(data, list) else []
 
         return await _do_fetch()
-
-    # ------------------------------------------------------------------ #
-    # 單筆查詢（含 Jitter + Circuit Breaker 檢查）                         #
-    # ------------------------------------------------------------------ #
 
     async def _query_one(
         self,
@@ -232,16 +205,11 @@ class CRDownloaderBrn:
         batch_id: str,
     ) -> dict:
         if self.cb.is_open():
-            cooldown_remaining = self.cb.cooldown - (
-                time.monotonic() - self.cb._opened_at
-            )
-            logger.debug(
-                f"Circuit Breaker OPEN，跳過 BRN={brn}，剩餘冷卻 {cooldown_remaining:.1f}s"
-            )
+            cooldown_remaining = self.cb.cooldown - (time.monotonic() - self.cb._opened_at)
+            logger.debug(f"Circuit Breaker OPEN，跳過 BRN={brn}，剩餘冷卻 {cooldown_remaining:.1f}s")
             return {"brn": brn, "status": "pending", "queried_at": None, "batch_id": batch_id, "records": []}
 
-        jitter = random.uniform(self.jitter_min, self.jitter_max)
-        await asyncio.sleep(jitter)
+        await asyncio.sleep(random.uniform(self.jitter_min, self.jitter_max))
 
         async with sem:
             try:
@@ -267,12 +235,7 @@ class CRDownloaderBrn:
                     "records": [],
                 }
 
-    # ------------------------------------------------------------------ #
-    # Parquet 串流寫入                                                     #
-    # ------------------------------------------------------------------ #
-
     def _flush_to_parquet(self, hit_records: list[dict], batch_id: str):
-        """將 hit 記錄追加寫入今日 Parquet 檔。"""
         if not hit_records:
             return
         today = datetime.now().strftime("%Y%m%d")
@@ -303,34 +266,20 @@ class CRDownloaderBrn:
         arrow_batch = df.to_arrow()
         if self._writer is None:
             self._schema = arrow_batch.schema
-            self._writer = pq.ParquetWriter(
-                output_parquet, self._schema, compression="snappy"
-            )
+            self._writer = pq.ParquetWriter(output_parquet, self._schema, compression="snappy")
         else:
             try:
                 arrow_batch = arrow_batch.cast(self._schema)
             except Exception:
                 for field in self._schema:
                     if field.name not in df.columns:
-                        df = df.with_columns(
-                            pl.lit(None).cast(pl.Utf8).alias(field.name)
-                        )
-                arrow_batch = df.select(
-                    [f.name for f in self._schema]
-                ).to_arrow().cast(self._schema)
+                        df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias(field.name))
+                arrow_batch = df.select([f.name for f in self._schema]).to_arrow().cast(self._schema)
 
         self._writer.write_table(arrow_batch)
         logger.info(f"Parquet flush: {len(hit_records)} 筆 hit（batch={batch_id}）")
 
-    # ------------------------------------------------------------------ #
-    # 單批下載                                                          #
-    # ------------------------------------------------------------------ #
-
     async def download_batch(self) -> dict:
-        """
-        從 brn_scan_queue 隨機抽取 pending BRN → 並發查詢 → 更新狀態。
-        回傳本批統計 {"total": N, "hit": N, "miss": N, "skipped": N}。
-        """
         if self.db is None:
             raise RuntimeError("download_batch 需要 db（DBWriter）實例")
 
@@ -341,9 +290,7 @@ class CRDownloaderBrn:
             logger.info("brn_scan_queue 中無 pending BRN，批次結束")
             return {"total": 0, "hit": 0, "miss": 0, "skipped": 0}
 
-        logger.info(
-            f"=== BRN 批次開始 batch={batch_id}，取得 {len(pending_brns)} 筆 pending ==="
-        )
+        logger.info(f"=== BRN 批次開始 batch={batch_id}，取得 {len(pending_brns)} 筆 pending ===")
 
         sem = asyncio.Semaphore(self.concurrency)
         tasks_results: list[dict] = []
@@ -352,10 +299,7 @@ class CRDownloaderBrn:
         batch_stopped = False
 
         async with httpx.AsyncClient(http2=True) as client:
-            tasks = [
-                self._query_one(client, sem, brn, batch_id)
-                for brn in pending_brns
-            ]
+            tasks = [self._query_one(client, sem, brn, batch_id) for brn in pending_brns]
             for coro in asyncio.as_completed(tasks):
                 result = await coro
                 tasks_results.append(result)
@@ -370,8 +314,7 @@ class CRDownloaderBrn:
                     consecutive_miss += 1
                     if consecutive_miss >= self.miss_limit:
                         logger.info(
-                            f"本批連續 miss {consecutive_miss} 次達到門檻 "
-                            f"({self.miss_limit})，停止本批（不影響整體掃描）"
+                            f"本批連續 miss {consecutive_miss} 次達到門檻 ({self.miss_limit})，停止本批"
                         )
                         batch_stopped = True
                         break
@@ -379,9 +322,7 @@ class CRDownloaderBrn:
         if all_hit_records:
             self._flush_to_parquet(all_hit_records, batch_id)
 
-        update_records = [
-            r for r in tasks_results if r["status"] in ("hit", "miss")
-        ]
+        update_records = [r for r in tasks_results if r["status"] in ("hit", "miss")]
         if update_records:
             self.db.bulk_update_brn_status(update_records)
 
@@ -395,16 +336,7 @@ class CRDownloaderBrn:
         logger.info(f"=== 批次完成 batch={batch_id} === {stats}")
         return stats
 
-    # ------------------------------------------------------------------ #
-    # 全量下載（與 pipeline 相容介面）                                    #
-    # ------------------------------------------------------------------ #
-
     async def download_all(self, resume: bool = True) -> Path:
-        """
-        循環執行 download_batch 直到 brn_scan_queue 中無 pending 為止。
-        回傳今日 Parquet 路徑（供 pipeline 讀入）。
-        resume 參數保留為相容介面，不影響 BRN 掃描行為。
-        """
         total_hit = 0
         total_miss = 0
         batch_num = 0
@@ -413,34 +345,24 @@ class CRDownloaderBrn:
 
         while True:
             stats = await self.download_batch()
-
             if stats["total"] == 0:
                 logger.info("=== 所有 BRN 已掃描完畢 ===")
                 break
-
             batch_num += 1
             total_hit += stats["hit"]
             total_miss += stats["miss"]
             logger.info(
-                f"[download_all] 累計 batch={batch_num}, "
-                f"hit={total_hit:,}, miss={total_miss:,}"
+                f"[download_all] 累計 batch={batch_num}, hit={total_hit:,}, miss={total_miss:,}"
             )
 
-        # 確保 Parquet writer 關閉
         self.close()
 
-        # 回傳今日 Parquet 路徑（如未有任何 hit 則回傳空路徑）
         if self._today_parquet is None:
             today = datetime.now().strftime("%Y%m%d")
             self._today_parquet = self.raw_dir / f"cr_brn_{today}.parquet"
         return self._today_parquet
 
-    # ------------------------------------------------------------------ #
-    # 與現有 CRDownloader 兼容介面                                          #
-    # ------------------------------------------------------------------ #
-
     def get_delta(self, yesterday_parquet: Path, today_parquet: Path) -> pl.DataFrame:
-        """增量比較介面（與 CRDownloader 相同）。"""
         keep_cols = ["cr_no", "name_zh", "name_en", "address_raw"]
 
         def safe_select(path: Path) -> pl.DataFrame:
@@ -456,7 +378,6 @@ class CRDownloaderBrn:
         return delta
 
     def close(self):
-        """關閉 Parquet writer。"""
         if self._writer:
             self._writer.close()
             self._writer = None
