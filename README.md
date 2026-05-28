@@ -152,6 +152,7 @@ python main.py --mode full --downloader brn
 - 查詢後自動更新 `hit`（有記錄）/ `miss`（無此 BRN）狀態
 - 中斷或失敗的 BRN 保持 `pending`，下次自動重試
 - 可重複排程執行，每次自動續掃
+- **每批完成後立即寫入 master**，Ctrl+C 不會丟失已完成資料
 
 **步驟三：查看掃描進度**
 
@@ -196,6 +197,7 @@ cr_brn:
   jitter_max: 0.30          # 最大 Jitter 延遲（秒）
   cb_threshold: 10          # Circuit Breaker 連續失敗門檻
   cb_cooldown: 60           # Circuit Breaker 冷卻時間（秒）
+  progress_every: 500       # 終端進度每隔幾筆刷新一次
 ```
 
 ### 回歸測試
@@ -203,6 +205,140 @@ cr_brn:
 ```bash
 python -m pytest tests/
 ```
+
+---
+
+## 查看已下載資料
+
+### 方法一：DuckDB Web UI（推薦）
+
+DuckDB 1.2+ 內建 `ui` 擴充，一行指令在瀏覽器開啟互動查詢介面：
+
+```bash
+duckdb data/hk_companies.duckdb -c "INSTALL ui; LOAD ui; CALL start_ui();"
+```
+
+開啟後瀏覽器自動跳至 `http://localhost:4213`，可直接查詢所有表。
+
+### 方法二：DuckDB CLI
+
+```bash
+# 安裝（macOS）
+brew install duckdb
+
+# 開啟資料庫
+duckdb data/hk_companies.duckdb
+```
+
+常用查詢：
+
+```sql
+-- 掃描進度（BRN 模式）
+SELECT status, COUNT(*) FROM brn_scan_queue GROUP BY status;
+
+-- master 公司數
+SELECT COUNT(*) FROM master;
+
+-- 按地區統計
+SELECT region, district, COUNT(*) n
+FROM master
+GROUP BY region, district
+ORDER BY n DESC;
+
+-- 搜尋公司名稱
+SELECT cr_no, name_zh, name_en, address_raw, district
+FROM master
+WHERE name_zh LIKE '%科技%'
+LIMIT 20;
+
+-- 查看需人工覆核的記錄
+SELECT cr_no, name_zh, address_raw, score
+FROM master
+WHERE manual_review = TRUE
+ORDER BY score
+LIMIT 20;
+```
+
+### 方法三：Python（快速確認）
+
+```python
+import duckdb
+
+con = duckdb.connect("data/hk_companies.duckdb")
+
+# 掃描進度
+print(con.execute("SELECT status, COUNT(*) n FROM brn_scan_queue GROUP BY status").df())
+
+# master 前 5 筆
+print(con.execute(
+    "SELECT cr_no, name_zh, company_type, date_of_incorporation FROM master LIMIT 5"
+).df())
+```
+
+### 方法四：Harlequin（終端 TUI）
+
+```bash
+pip install harlequin
+harlequin data/hk_companies.duckdb
+```
+
+---
+
+## 輸出 CSV
+
+### 全部 master 資料
+
+```bash
+duckdb data/hk_companies.duckdb -c "
+COPY master TO 'output/master.csv' (HEADER, DELIMITER ',');
+"
+```
+
+### 按條件篩選後匯出
+
+```bash
+# 篩選特定地區
+duckdb data/hk_companies.duckdb -c "
+COPY (
+    SELECT cr_no, name_zh, name_en, address_raw, district, latitude, longitude
+    FROM master
+    WHERE district = '油尖旺區'
+) TO 'output/yautsimmong.csv' (HEADER, DELIMITER ',');
+"
+
+# 只匯出有座標的記錄
+duckdb data/hk_companies.duckdb -c "
+COPY (
+    SELECT * FROM master
+    WHERE latitude IS NOT NULL
+) TO 'output/master_geocoded.csv' (HEADER, DELIMITER ',');
+"
+```
+
+### 用 Python 匯出（更靈活）
+
+```python
+import duckdb
+import polars as pl
+
+con = duckdb.connect("data/hk_companies.duckdb")
+
+# 全部 master
+df = con.execute("SELECT * FROM master").pl()
+df.write_csv("output/master.csv")
+print(f"匯出 {len(df):,} 筆至 output/master.csv")
+
+# 只取需要的欄位
+df = con.execute("""
+    SELECT cr_no, name_zh, name_en, district, street_name,
+           building_name, latitude, longitude
+    FROM master
+    WHERE manual_review = FALSE
+""").pl()
+df.write_csv("output/master_clean.csv")
+```
+
+> 建議先 `mkdir output` 建立輸出目錄。
 
 ---
 
