@@ -21,7 +21,9 @@ API：
   GET https://data.cr.gov.hk/cr/api/api/v1/api_builder/json/local/search
   query[0][key1]=Brn&query[0][key2]=equal&query[0][key3]=<BRN>&format=json
 
-  注意：API 要求方括號不被 URL encode，使用手動拼接 URL 而非 httpx params 。
+  注意：
+  1. API 要求方括號不被 URL encode，使用手動拼接 URL 而非 httpx params。
+  2. 不存在的 BRN API 回傳 400（而非空陣列），程式將 400 視為 miss。
 """
 
 import asyncio
@@ -164,33 +166,45 @@ class CRDownloaderBrn:
             f"&format=json"
         )
 
-    async def _fetch_brn(self, client: httpx.AsyncClient, brn: str) -> list[dict]:
+    async def _fetch_brn(self, client: httpx.AsyncClient, brn: str) -> list[dict] | None:
+        """
+        查詢單筆 BRN。
+        回傳：
+          - list[dict]：查詢成功（可能空 list 表示 miss）
+          - None：API 回傳 400，視為 miss（不重試）
+        僅對 429/503/網路錯誤重試。
+        """
+        url = self._build_url(brn)
+
         @retry(
             stop=stop_after_attempt(5),
             wait=wait_exponential(multiplier=1, min=3, max=60),
             retry=retry_if_exception_type(
-                (httpx.HTTPStatusError, httpx.TransportError, httpx.TimeoutException)
+                (httpx.TransportError, httpx.TimeoutException)
             ),
             before_sleep=before_sleep_log(logger, logging.WARNING),
             reraise=True,
         )
-        async def _do_fetch() -> list[dict]:
-            url = self._build_url(brn)  # 手動拼 URL，不經 httpx params encode
+        async def _do_fetch() -> list[dict] | None:
             resp = await client.get(
                 url,
                 timeout=self.request_timeout,
                 headers=self._next_headers(),
             )
+            # 400 = BRN 不存在 / 不合法，視為 miss，不重試
+            if resp.status_code == 400:
+                logger.debug(f"BRN={brn} → 400（視為 miss）")
+                return None
             if resp.status_code == 429:
                 retry_after = float(resp.headers.get("Retry-After", self.cb_cooldown))
                 logger.warning(f"BRN={brn} → 429，等待 {retry_after}s")
                 self.cb.record_failure()
                 await asyncio.sleep(retry_after)
-                resp.raise_for_status()
+                resp.raise_for_status()  # 觸發重試
             if resp.status_code == 503:
                 logger.warning(f"BRN={brn} → 503")
                 self.cb.record_failure()
-                resp.raise_for_status()
+                resp.raise_for_status()  # 觸發重試
             resp.raise_for_status()
             data = resp.json()
             return data if isinstance(data, list) else []
@@ -213,9 +227,15 @@ class CRDownloaderBrn:
 
         async with sem:
             try:
-                records = await self._fetch_brn(client, brn)
+                result = await self._fetch_brn(client, brn)
                 self.cb.record_success()
-                status = "hit" if records else "miss"
+                # None = 400 miss；[] = 空結果 miss；[...] = hit
+                if result is None or len(result) == 0:
+                    status = "miss"
+                    records = []
+                else:
+                    status = "hit"
+                    records = result
                 logger.debug(f"BRN={brn} → {status}（{len(records)} 筆）")
                 return {
                     "brn": brn,
