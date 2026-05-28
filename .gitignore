@@ -38,3 +38,5 @@ htmlcov/
 # 注意: 以下種子資料應保留追蹤
 # data/alias_map.json         ← 保留
 # data/industry_keywords.json ← 保留
+
+output/master.csv
