@@ -9,11 +9,11 @@ BRN 盲查下載器：透過 BRN（Business Registration Number）逐筆查詢�
   - 查詢後批次更新 hit/miss 狀態
   - 中斷安全：失敗保持 pending，下次自動重試
 
-反爬機制：
+反結機制：
   - User-Agent 輪換（4 個真實瀏覽器 UA）
   - Jitter 隨機延遲
   - 429 精確退避（讀取 Retry-After）
-  - Circuit Breaker（連續失敗熔斷）
+  - Circuit Breaker（連續失敗熱斷）
   - Tenacity 指數重試（最多 5 次）
   - Referer 偽裝
 
@@ -67,7 +67,7 @@ class CircuitBreakerState(Enum):
 
 
 class CircuitBreaker:
-    """連續失敗熔斷器，保護目標服務。"""
+    """連續失敗熱斷器，保護目標服務。"""
 
     def __init__(self, threshold: int = 10, cooldown: float = 60.0):
         self.threshold = threshold
@@ -148,6 +148,7 @@ class CRDownloaderBrn:
         self._write_buffer: list[dict] = []
         self._writer: pq.ParquetWriter | None = None
         self._schema: pa.Schema | None = None
+        self._today_parquet: Path | None = None
 
         logger.info(
             f"CRDownloaderBrn 初始化：mode={self.mode}, "
@@ -155,7 +156,7 @@ class CRDownloaderBrn:
         )
 
     # ------------------------------------------------------------------ #
-    # 反爬：Header 輪換                                                    #
+    # 反結：Header 輪換                                                    #
     # ------------------------------------------------------------------ #
 
     def _next_headers(self) -> dict:
@@ -206,7 +207,7 @@ class CRDownloaderBrn:
                 logger.warning(f"BRN={brn} → 429，等待 {retry_after}s")
                 self.cb.record_failure()
                 await asyncio.sleep(retry_after)
-                resp.raise_for_status()  # 觸發 retry
+                resp.raise_for_status()
 
             if resp.status_code == 503:
                 logger.warning(f"BRN={brn} → 503")
@@ -230,11 +231,6 @@ class CRDownloaderBrn:
         brn: str,
         batch_id: str,
     ) -> dict:
-        """
-        查詢單筆 BRN，回傳狀態記錄：
-        {"brn": ..., "status": "hit"|"miss", "queried_at": ..., "batch_id": ..., "records": [...]}
-        """
-        # Circuit Breaker 檢查
         if self.cb.is_open():
             cooldown_remaining = self.cb.cooldown - (
                 time.monotonic() - self.cb._opened_at
@@ -242,10 +238,8 @@ class CRDownloaderBrn:
             logger.debug(
                 f"Circuit Breaker OPEN，跳過 BRN={brn}，剩餘冷卻 {cooldown_remaining:.1f}s"
             )
-            # 不標記 miss，保持 pending 等待冷卻
             return {"brn": brn, "status": "pending", "queried_at": None, "batch_id": batch_id, "records": []}
 
-        # Jitter 延遲
         jitter = random.uniform(self.jitter_min, self.jitter_max)
         await asyncio.sleep(jitter)
 
@@ -267,7 +261,7 @@ class CRDownloaderBrn:
                 logger.error(f"BRN={brn} 最終失敗：{exc}")
                 return {
                     "brn": brn,
-                    "status": "pending",  # 保持 pending，下次重試
+                    "status": "pending",
                     "queried_at": None,
                     "batch_id": batch_id,
                     "records": [],
@@ -283,13 +277,13 @@ class CRDownloaderBrn:
             return
         today = datetime.now().strftime("%Y%m%d")
         output_parquet = self.raw_dir / f"cr_brn_{today}.parquet"
+        self._today_parquet = output_parquet
         fetched_at = datetime.now().isoformat()
 
         for r in hit_records:
             r["fetched_at"] = fetched_at
 
         df = pl.DataFrame(hit_records)
-        # 統一欄位名稱
         rename_map = {
             "Brn": "cr_no",
             "Chinese_Company_Name": "name_zh",
@@ -329,7 +323,7 @@ class CRDownloaderBrn:
         logger.info(f"Parquet flush: {len(hit_records)} 筆 hit（batch={batch_id}）")
 
     # ------------------------------------------------------------------ #
-    # 主入口：批次下載                                                      #
+    # 單批下載                                                          #
     # ------------------------------------------------------------------ #
 
     async def download_batch(self) -> dict:
@@ -354,8 +348,6 @@ class CRDownloaderBrn:
         sem = asyncio.Semaphore(self.concurrency)
         tasks_results: list[dict] = []
         all_hit_records: list[dict] = []
-
-        # 本批連續 miss 計數器
         consecutive_miss = 0
         batch_stopped = False
 
@@ -371,7 +363,6 @@ class CRDownloaderBrn:
                 if result["status"] == "hit":
                     consecutive_miss = 0
                     all_hit_records.extend(result["records"])
-                    # batch_write 門檻觸發 Parquet flush
                     if len(all_hit_records) >= self.batch_write:
                         self._flush_to_parquet(all_hit_records, batch_id)
                         all_hit_records = []
@@ -385,11 +376,9 @@ class CRDownloaderBrn:
                         batch_stopped = True
                         break
 
-        # 剩餘 hit records flush
         if all_hit_records:
             self._flush_to_parquet(all_hit_records, batch_id)
 
-        # 批次更新 DB 狀態
         update_records = [
             r for r in tasks_results if r["status"] in ("hit", "miss")
         ]
@@ -405,6 +394,46 @@ class CRDownloaderBrn:
         }
         logger.info(f"=== 批次完成 batch={batch_id} === {stats}")
         return stats
+
+    # ------------------------------------------------------------------ #
+    # 全量下載（與 pipeline 相容介面）                                    #
+    # ------------------------------------------------------------------ #
+
+    async def download_all(self, resume: bool = True) -> Path:
+        """
+        循環執行 download_batch 直到 brn_scan_queue 中無 pending 為止。
+        回傳今日 Parquet 路徑（供 pipeline 讀入）。
+        resume 參數保留為相容介面，不影響 BRN 掃描行為。
+        """
+        total_hit = 0
+        total_miss = 0
+        batch_num = 0
+
+        logger.info("=== download_all 開始，循環執行到佇列空 —— Ctrl+C 可安全中斷 ===")
+
+        while True:
+            stats = await self.download_batch()
+
+            if stats["total"] == 0:
+                logger.info("=== 所有 BRN 已掃描完畢 ===")
+                break
+
+            batch_num += 1
+            total_hit += stats["hit"]
+            total_miss += stats["miss"]
+            logger.info(
+                f"[download_all] 累計 batch={batch_num}, "
+                f"hit={total_hit:,}, miss={total_miss:,}"
+            )
+
+        # 確保 Parquet writer 關閉
+        self.close()
+
+        # 回傳今日 Parquet 路徑（如未有任何 hit 則回傳空路徑）
+        if self._today_parquet is None:
+            today = datetime.now().strftime("%Y%m%d")
+            self._today_parquet = self.raw_dir / f"cr_brn_{today}.parquet"
+        return self._today_parquet
 
     # ------------------------------------------------------------------ #
     # 與現有 CRDownloader 兼容介面                                          #
