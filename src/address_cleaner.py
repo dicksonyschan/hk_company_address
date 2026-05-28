@@ -3,18 +3,16 @@ address_cleaner.py
 地址前處理：去雜訊、Unicode 正規化、繁簡統一、別名替換。
 送 ALS 前先清洗，命中率可從 ~60% 提升至 ~90%+。
 
-優化:
-- __init__ 時預排序別名（避免每次 clean() 重排）
-- 新增大量常見 HK 地址縮寫/錯字/同音字，提升 ALS 命中率
-- OpenCC converter 改為 instance 變量（thread-safe）
-- clean_batch 可選 parallel 模式（大批次用 multiprocessing）
+修補 (audit):
+- 新增 KOWLOON / NEW TERRITORIES / ISLANDS 移除規則（避免干擾 ALS 評分）
+- 新增連續逗號/空格清理（如 "803B,, 8樓,," -> "803B, 8樓"）
+- 補充九龍著名大廈/街道別名，提升 ALS 命中率
 """
 
 import json
 import re
 import unicodedata
 from pathlib import Path
-from typing import Optional
 
 # --- OpenCC 初始化（instance 層，thread-safe）---
 def _make_converter():
@@ -31,6 +29,11 @@ _NOISE_PATTERNS = [
     r"香港特區",
     r"HONG\s*KONG\s*SAR",
     r"HONG\s*KONG",
+    # audit fix: 移除 KOWLOON / NEW TERRITORIES / ISLANDS 等對 ALS 毫無幫助的地域詞
+    r"\bKOWLOON\b",
+    r"\bNEW\s*TERRITORIES\b",
+    r"\bISLANDS\s*DISTRICT\b",
+    r"\bNEW\s*KOWLOON\b",
     r"c/?o\s+[^,，]+",
     r"attn[：:.]?\s*[^,，]+",
     r"\b\d{8}\b",
@@ -40,40 +43,37 @@ _NOISE_PATTERNS = [
     r"\bP\.?O\.?\s*Box\s*\d+",
     r"[\U0001F600-\U0001FFFF]",
     r"\u200b|\ufeff|\u00a0",
-    r"room\s*(?=\d)",     # "Room 1234" -> "1234" (讓 ALS 自行解析)
-    r"flat\s*(?=[A-Z]\d|\d)",
-    r"unit\s*(?=[A-Z]\d|\d)",
+    r"(?i)\broom\s*(?=\d)",
+    r"(?i)\bflat\s*(?=[A-Z]\d|\d)",
+    r"(?i)\bunit\s*(?=[A-Z]\d|\d)",
 ]
 _NOISE_RE = re.compile("|".join(_NOISE_PATTERNS), re.IGNORECASE)
 
+# audit fix: 連續逗號/空格清理（如 "803B,, 8樓,, 街道" -> "803B, 8樓, 街道"）
+_MULTI_COMMA_RE = re.compile(r"[,，]\s*[,，]+")
+
 # 全形 -> 半形
-# P2 #11: 改用 dict 形式 str.maketrans，逐項明確對齊，確保無歧義
 _FULLWIDTH_TABLE = str.maketrans({
-    # 數字
     '０': '0', '１': '1', '２': '2', '３': '3', '４': '4',
     '５': '5', '６': '6', '７': '7', '８': '8', '９': '9',
-    # 大寫英文
     'Ａ': 'A', 'Ｂ': 'B', 'Ｃ': 'C', 'Ｄ': 'D', 'Ｅ': 'E',
     'Ｆ': 'F', 'Ｇ': 'G', 'Ｈ': 'H', 'Ｉ': 'I', 'Ｊ': 'J',
     'Ｋ': 'K', 'Ｌ': 'L', 'Ｍ': 'M', 'Ｎ': 'N', 'Ｏ': 'O',
     'Ｐ': 'P', 'Ｑ': 'Q', 'Ｒ': 'R', 'Ｓ': 'S', 'Ｔ': 'T',
     'Ｕ': 'U', 'Ｖ': 'V', 'Ｗ': 'W', 'Ｘ': 'X', 'Ｙ': 'Y', 'Ｚ': 'Z',
-    # 小寫英文
     'ａ': 'a', 'ｂ': 'b', 'ｃ': 'c', 'ｄ': 'd', 'ｅ': 'e',
     'ｆ': 'f', 'ｇ': 'g', 'ｈ': 'h', 'ｉ': 'i', 'ｊ': 'j',
     'ｋ': 'k', 'ｌ': 'l', 'ｍ': 'm', 'ｎ': 'n', 'ｏ': 'o',
     'ｐ': 'p', 'ｑ': 'q', 'ｒ': 'r', 'ｓ': 's', 'ｔ': 't',
     'ｕ': 'u', 'ｖ': 'v', 'ｗ': 'w', 'ｘ': 'x', 'ｙ': 'y', 'ｚ': 'z',
-    # 標點 / 括號（。保留全形，其餘改半形）
     '，': ',', '！': '!', '？': '?', '；': ';', '：': ':',
     '「': '"', '」': '"', '『': "'", '』': "'",
     '（': '(', '）': ')', '【': '[', '】': ']',
 })
 
-# 內建的常見 HK 地址別名（補充 alias_map.json 沒有的）
-# 涵蓋：常見縮寫、錯別字、英文->中文、舊地名
+# 內建的常見 HK 地址別名
 _BUILTIN_ALIASES: dict[str, str] = {
-    # 地區縮寫（英文）
+    # 地區（英文全稱）
     "Causeway Bay": "銅鑼灣",
     "Tsim Sha Tsui": "尖沙咀",
     "Mong Kok": "旺角",
@@ -157,6 +157,33 @@ _BUILTIN_ALIASES: dict[str, str] = {
     "Lohas Park": "日出康城",
     "Sunny Bay": "欣澳",
     "Disneyland": "迪士尼",
+    # audit: 補充九龍著名街道/大廈英文名（常見於 CR 地址）
+    "Nathan Road": "彌敦道",
+    "Un Chau Street": "元州街",
+    "Cheung Sha Wan Road": "長沙灣道",
+    "Castle Peak Road": "青山道",
+    "Argyle Street": "亞皆老街",
+    "Boundary Street": "界限街",
+    "Prince Edward Road": "太子道",
+    "Waterloo Road": "窩打老道",
+    "Lai Chi Kok Road": "荔枝角道",
+    "Ma Tau Wai Road": "馬頭圍道",
+    "Hung Hom Road": "紅磡道",
+    "Chatham Road": "漆咸道",
+    "Austin Road": "柯士甸道",
+    "Canton Road": "廣東道",
+    "Granville Road": "加連威老道",
+    "Kimberley Road": "金巴利道",
+    "Carnarvon Road": "加拿芬道",
+    "Haiphong Road": "海防道",
+    "Peking Road": "北京道",
+    "Salisbury Road": "梳士巴利道",
+    "Reclamation Street": "填地街",
+    "Shanghai Street": "上海街",
+    "Temple Street": "廟街",
+    "Portland Street": "砵蘭街",
+    "Dundas Street": "登打士街",
+    "Sai Yeung Choi Street": "西洋菜街",
     # 縮寫
     "TST": "尖沙咀",
     "CWB": "銅鑼灣",
@@ -182,7 +209,6 @@ _BUILTIN_ALIASES: dict[str, str] = {
     "汪角": "旺角",
     "佐頓": "佐敦",
     "鰂漁涌": "鰂魚涌",
-    # P2 #12: 刪除冗餘自映射 "佐敦":"佐敦"
     "彌頓": "彌敦",
     "彌敦道": "彌敦道",
     "啟德": "啟德",
@@ -191,7 +217,7 @@ _BUILTIN_ALIASES: dict[str, str] = {
     "G/F": "地鋪",
     "G/f": "地鋪",
     "UG": "地鋪",
-    # 街道類型英中（P1 #7: 改為 word-boundary regex，在 AddressCleaner.__init__ 處理）
+    # 街道類型
     "Road": "道",
     "Street": "街",
     "Avenue": "道",
@@ -200,8 +226,7 @@ _BUILTIN_ALIASES: dict[str, str] = {
     "Drive": "道",
 }
 
-# P2 #10: 樓層寫法統一用精確 regex，避免 "21/F" 被 "1/F" 誤匹配
-# 長模式優先（B2/F、B1/F 在 B/F 前；高樓層在低樓層前）
+# 樓層寫法統一用精確 regex
 _FLOOR_ALIASES: list[tuple[str, str]] = [
     (r'(?<!\d)B2/F(?!\d)', '地庫2樓'),
     (r'(?<!\d)B1/F(?!\d)', '地庫1樓'),
@@ -214,29 +239,23 @@ _FLOOR_ALIASES: list[tuple[str, str]] = [
 
 class AddressCleaner:
     def __init__(self, alias_map_path: str = "data/alias_map.json"):
-        # 合併內建別名 + 外部 alias_map（外部優先）
         merged: dict[str, str] = dict(_BUILTIN_ALIASES)
         alias_path = Path(alias_map_path)
         if alias_path.exists():
             raw = json.loads(alias_path.read_text(encoding="utf-8"))
             external = {k: v for k, v in raw.items() if not k.startswith("_")}
-            merged.update(external)  # 外部 alias_map 覆蓋內建
+            merged.update(external)
 
-        # P1 #7: 分離英文別名（word-boundary regex）與中文別名（str.replace）
-        # 排序：長詞優先，避免部分匹配問題（只排一次）
         self._regex_aliases: list[tuple[re.Pattern, str]] = []
         self._plain_aliases: list[tuple[str, str]] = []
         for alias, standard in sorted(merged.items(), key=lambda x: -len(x[0])):
             if re.search(r'[A-Za-z]', alias):
-                # 英文別名：用 \b word-boundary，避免 "Road" 誤改 "Broadcasting"
                 self._regex_aliases.append(
                     (re.compile(r'\b' + re.escape(alias) + r'\b', re.IGNORECASE), standard)
                 )
             else:
-                # 中文別名：直接 str.replace（中文無詞邊界問題）
                 self._plain_aliases.append((alias, standard))
 
-        # 每個 instance 獨立 OpenCC（thread-safe）
         self._converter = _make_converter()
 
     def clean(self, address: str) -> str:
@@ -256,26 +275,29 @@ class AddressCleaner:
         if self._converter:
             s = self._converter.convert(s)
 
-        # 4. 去除雜訊
+        # 4. 去除雜訊（含 KOWLOON / NEW TERRITORIES）
         s = _NOISE_RE.sub(" ", s)
 
-        # 5a. P2 #10: 樓層寫法用精確 regex（優先於別名替換，避免 "21/F" 被誤改）
+        # 5. audit fix: 壓縮連續逗號（",," -> ","）
+        s = _MULTI_COMMA_RE.sub(",", s)
+
+        # 6a. 樓層寫法用精確 regex
         for floor_pat, floor_std in _FLOOR_ALIASES:
             s = re.sub(floor_pat, floor_std, s)
 
-        # 5b. P1 #7: 英文別名用 word-boundary regex
+        # 6b. 英文別名用 word-boundary regex
         for pattern, standard in self._regex_aliases:
             s = pattern.sub(standard, s)
 
-        # 5c. 中文別名直接 str.replace（長詞優先）
+        # 6c. 中文別名直接 str.replace
         for alias, standard in self._plain_aliases:
             if alias in s:
                 s = s.replace(alias, standard)
 
-        # 6. 多餘空白壓縮
+        # 7. 多餘空白壓縮
         s = re.sub(r"\s+", " ", s).strip()
 
-        # 7. 移除開頭結尾的標點
+        # 8. 移除開頭結尾的標點
         s = s.strip("，,;；.。-/\\")
 
         return s
