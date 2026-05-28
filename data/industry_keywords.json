@@ -1,0 +1,21 @@
+{
+  "A": ["農業", "漁業", "林業", "農場", "種植", "水產", "農莊", "Farm", "Fishery", "Agriculture", "Aquaculture", "Horticulture"],
+  "B": ["採石", "採礦", "礦業", "石礦", "Mining", "Quarrying", "Mineral"],
+  "C": ["製造", "加工", "廠", "生產", "工廠", "製品", "印刷", "紡織", "食品製造", "Manufacturing", "Factory", "Production", "Printing", "Textile", "Processing"],
+  "D": ["電力", "燃氣", "煤氣", "能源", "電網", "發電", "Power", "Electric", "Gas", "Energy", "Utility"],
+  "E": ["供水", "廢物", "環保", "回收", "污水", "廢水", "清潔", "Water", "Waste", "Recycling", "Environmental", "Sanitation", "Sewerage"],
+  "F": ["建築", "建造", "工程", "裝修", "裝潢", "裝飾", "地基", "土木", "建設", "施工", "鋁窗", "鋼構", "機電", "消防工程", "冷氣工程", "管道", "玻璃工程", "Construction", "Engineering", "Renovation", "Contractors", "Building", "Civil", "Structural", "Fitting", "Interior Design"],
+  "G": ["貿易", "批發", "零售", "商行", "百貨", "超市", "商店", "行", "店", "商貿", "進出口", "出入口", "銷售", "供應商", "代理", "經銷", "Trading", "Wholesale", "Retail", "Import", "Export", "Distribution", "Merchandise", "Dealer", "Supplier", "Distributor"],
+  "H": ["運輸", "物流", "倉庫", "貨運", "速遞", "航運", "港口", "郵政", "快遞", "倉儲", "搬運", "車隊", "的士", "巴士", "Transport", "Logistics", "Freight", "Shipping", "Courier", "Warehouse", "Storage", "Port", "Aviation", "Airlines"],
+  "I": ["餐廳", "飲食", "食品", "酒樓", "茶餐廳", "咖啡", "酒店", "旅館", "賓館", "餐飲", "外賣", "飯店", "小食", "甜品", "燒烤", "火鍋", "Restaurant", "Hotel", "Catering", "Food", "Cafe", "Bistro", "Bakery", "Kitchen", "Hospitality", "Motel", "Hostel"],
+  "J": ["科技", "資訊", "軟件", "系統", "網絡", "電訊", "通訊", "電腦", "互聯網", "數碼", "數位", "雲端", "人工智能", "AI", "應用", "平台", "媒體", "Technology", "Software", "IT", "Digital", "Internet", "Telecom", "Network", "Cloud", "Media", "Platform", "Data", "Cyber"],
+  "K": ["銀行", "財務", "金融", "保險", "證券", "投資", "基金", "信貸", "融資", "資本", "資產管理", "財富", "外匯", "期貨", "Bank", "Finance", "Insurance", "Securities", "Investment", "Fund", "Capital", "Asset", "Wealth", "Credit", "Forex", "Futures"],
+  "L": ["地產", "物業", "房地產", "發展商", "樓盤", "屋苑", "測量", "業主", "租賃", "樓宇", "Property", "Real Estate", "Realty", "Estate", "Surveying", "Leasing", "Developer"],
+  "M": ["顧問", "諮詢", "律師", "法律", "會計", "核數", "工程師", "建築師", "設計", "研究", "測試", "實驗室", "管理顧問", "Consulting", "Advisory", "Legal", "Accounting", "Audit", "Architect", "Design", "Research", "Laboratory", "Management"],
+  "N": ["人力資源", "人事", "外判", "清潔服務", "保安", "物業管理", "旅行社", "租車", "會議", "Staffing", "Recruitment", "Cleaning", "Security", "Facilities", "Travel", "Car Rental", "Events", "Outsourcing"],
+  "O": ["政府", "公務", "市政", "Government", "Public", "Municipal"],
+  "P": ["學校", "教育", "培訓", "學院", "大學", "幼稚園", "補習", "書院", "教學", "學習", "School", "Education", "Training", "Academy", "University", "College", "Learning", "Institute", "Tutorial"],
+  "Q": ["醫療", "醫院", "診所", "藥房", "健康", "醫學", "護理", "社會服務", "養老", "康復", "牙醫", "中醫", "西醫", "Medical", "Hospital", "Clinic", "Pharmacy", "Health", "Healthcare", "Nursing", "Dental", "Welfare", "Social"],
+  "R": ["娛樂", "藝術", "體育", "音樂", "電影", "遊戲", "健身", "球場", "博彩", "展覽", "表演", "Entertainment", "Arts", "Sports", "Music", "Film", "Gaming", "Fitness", "Recreation", "Events", "Exhibition"],
+  "S": ["美容", "美髮", "洗衣", "修理", "維修", "寵物", "禮儀", "婚禮", "殯儀", "宗教", "Beauty", "Salon", "Laundry", "Repair", "Maintenance", "Pet", "Wedding", "Funeral", "Religious"]
+}
