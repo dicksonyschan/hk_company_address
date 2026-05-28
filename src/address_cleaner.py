@@ -41,9 +41,10 @@ def _make_noise_re() -> re.Pattern:
         r"[\U0001F600-\U0001FFFF]",
         r"\u200b|\ufeff|\u00a0",
         # Room/Flat/Unit 前置詞（只移前置詞，保留後面的序號）
-        r"(?i)\broom\s*(?=\d|[A-Z]\d)",
-        r"(?i)\bflat\s*(?=\d|[A-Z]\d)",
-        r"(?i)\bunit\s*(?=\d|[A-Z]\d)",
+        # Note: inline (?i) flags removed; re.IGNORECASE is applied at compile time
+        r"\broom\s*(?=\d|[A-Z]\d)",
+        r"\bflat\s*(?=\d|[A-Z]\d)",
+        r"\bunit\s*(?=\d|[A-Z]\d)",
     ]
     return re.compile("|".join(patterns), re.IGNORECASE)
 
