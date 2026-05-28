@@ -39,4 +39,4 @@ htmlcov/
 # data/alias_map.json         ← 保留
 # data/industry_keywords.json ← 保留
 
-output/master.csv
+output/
